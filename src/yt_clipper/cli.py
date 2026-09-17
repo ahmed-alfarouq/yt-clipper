@@ -11,6 +11,8 @@ def main():
     parser.add_argument("end", nargs="?")
     parser.add_argument("-o", "--output", default="clip.mp4")
     parser.add_argument("-q", "--quality", default="best", choices=["best", "4k", "1080p", "720p"])
+    parser.add_argument("-a", "--audio-only", action="store_true",
+                         help="Extract audio only and save as MP3")
     parser.add_argument("--list-formats", action="store_true")
     args = parser.parse_args()
 
@@ -21,9 +23,15 @@ def main():
             return
         if not args.start or not args.end:
             parser.error("start and end times are required unless using --list-formats")
-        downloader.download_clip(args.url, time_to_seconds(args.start), time_to_seconds(args.end),
-                                  args.output, args.quality)
-        print(f"✅ Saved to {args.output}")
+        output_path = downloader.download_clip(
+            args.url,
+            time_to_seconds(args.start),
+            time_to_seconds(args.end),
+            args.output,
+            args.quality,
+            audio_only=args.audio_only,
+        )
+        print(f"✅ Saved to {output_path}")
     except Exception as e:
         print(f"❌ Error: {e}", file=sys.stderr)
         sys.exit(1)
