@@ -1,4 +1,7 @@
 import re
+import os
+import sys
+import subprocess
  
 _WINDOWS_INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED_NAMES = {
@@ -6,7 +9,7 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
- 
+
 def sanitize_filename(name, fallback="clip", max_length=150):
     """Turn an arbitrary string (e.g. a video title) into a filename stem
     that is safe on Windows (and harmless on other platforms).
@@ -29,6 +32,16 @@ def sanitize_filename(name, fallback="clip", max_length=150):
         name = name[:max_length].rstrip(" .") or fallback
  
     return name
+
+
+def open_containing_folder(file_path):
+    folder = os.path.dirname(os.path.abspath(file_path))
+    if sys.platform == "win32":
+        os.startfile(folder)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", folder])
+    else:
+        subprocess.run(["xdg-open", folder])
 
 def format_seconds(seconds):
     seconds = int(seconds)

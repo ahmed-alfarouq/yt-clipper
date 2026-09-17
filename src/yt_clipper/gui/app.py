@@ -5,10 +5,12 @@ import os
 import queue
 import re
 import threading
+from turtle import title
 import urllib.request
 import webbrowser
 from pathlib import Path
-
+import subprocess
+import sys
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
@@ -19,7 +21,7 @@ except ImportError:  # The rest of the application can still run without thumbna
 
 from yt_clipper.core import config as app_config
 from yt_clipper.core import downloader, updater
-from yt_clipper.core.utils import format_seconds
+from yt_clipper.core.utils import format_seconds, sanitize_filename
 from yt_clipper.gui.models import DownloadJob
 from yt_clipper.gui.services import SequentialDownloadQueue
 from yt_clipper.gui.widgets.time_input import TimeInput
@@ -28,7 +30,7 @@ from yt_clipper.gui.widgets.time_input import TimeInput
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-CURRENT_VERSION = "1.0.0"
+CURRENT_VERSION = "1.1.0"
 UPDATE_OWNER = "ahmed-alfarouq"
 UPDATE_REPO = "yt-clipper"
 
@@ -228,6 +230,13 @@ class ClipperApp(ctk.CTk):
             hover_color="gray20",
         ).pack(side="left")
 
+        self.open_folder_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            card,
+            text="📂 Open folder after download",
+            variable=self.open_folder_var,
+        ).pack(anchor="w", padx=20, pady=(8, 0))
+        
         download_row = ctk.CTkFrame(card, fg_color="transparent")
         download_row.pack(fill="x", padx=20, pady=(25, 10))
         self.download_button = ctk.CTkButton(
@@ -408,7 +417,8 @@ class ClipperApp(ctk.CTk):
         self.video_duration = duration
         self.loaded_url = url
         self.loaded_title = title
-
+        self._apply_suggested_filename(title)
+        
         self.start_slider.configure(to=duration, state="normal")
         self.end_slider.configure(to=duration, state="normal")
         self.start_slider.set(0)
@@ -424,6 +434,19 @@ class ClipperApp(ctk.CTk):
             text_color="#4da6ff",
         )
         self.update_clip_length()
+
+    def _apply_suggested_filename(self, title):
+        current = self.output_entry.get().strip()
+        directory = os.path.dirname(current) if current else ""
+        if not directory:
+            directory = str(self._default_output_path().parent)
+
+        safe_name = sanitize_filename(title) or "clip"
+        extension = ".mp3" if self.audio_only_var.get() else ".mp4"
+        suggested = Path(directory) / f"{safe_name}{extension}"
+
+        self.output_entry.delete(0, "end")
+        self.output_entry.insert(0, str(suggested))
 
     def _apply_video_thumbnail(self, request_id, thumbnail, thumbnail_failed):
         if request_id != self._load_request_id:
@@ -526,6 +549,19 @@ class ClipperApp(ctk.CTk):
         self.app_config["last_output_dir"] = str(normalized.parent)
         app_config.save_config(self.app_config)
 
+    def _open_containing_folder(self, file_path):
+        folder = os.path.dirname(os.path.abspath(file_path))
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", folder], check=False)
+            else:
+                subprocess.run(["xdg-open", folder], check=False)
+        except Exception:
+            # Opening the folder is a convenience feature; failures here
+            # should never interrupt or overshadow a successful download.
+            pass
     # ---------- Time synchronization ----------
 
     def on_start_change(self, seconds):
@@ -669,6 +705,7 @@ class ClipperApp(ctk.CTk):
 
         self.app_config["last_output_dir"] = str(output_path.parent)
         app_config.save_config(self.app_config)
+        self.reset_fields()
 
     def _unique_output_path(self, requested_path):
         reserved = {
@@ -881,6 +918,10 @@ class ClipperApp(ctk.CTk):
         job.progress = 1.0
         self._active_job_id = None
         self.progress.set(1)
+        
+        if self.open_folder_var.get():                 
+            self._open_containing_folder(job.output_path)
+            
         self.set_status(f"✅ Saved to {job.output_path}", "#4caf50")
         self.render_queue()
 
@@ -906,6 +947,25 @@ class ClipperApp(ctk.CTk):
             self.progress.set(0)
         self.set_status(f"Cancelled: {Path(job.output_path).name}", "gray")
         self.render_queue()
+
+    def reset_fields(self):
+        self.url_entry.delete(0, "end")
+        self.loaded_url = None
+        self.loaded_title = None
+        self.video_duration = None
+        self._set_thumbnail(None, False)
+        self.video_info_label.configure(text="No video loaded yet", text_color="gray")
+
+        self.start_slider.configure(to=100, state="disabled")
+        self.end_slider.configure(to=100, state="disabled")
+        self.start_slider.set(0)
+        self.end_slider.set(100)
+        self.start_input.set_seconds(0)
+        self.end_input.set_seconds(0)
+        self.clip_length_label.configure(text="Clip length: —")
+
+        self.output_entry.delete(0, "end")
+        self.output_entry.insert(0, str(self._default_output_path()))
 
     def _queue_idle(self):
         self._active_job_id = None
