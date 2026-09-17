@@ -15,8 +15,15 @@ class ClipperApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("YouTube Clipper")
-        self.geometry("580x760")
-        self.resizable(False, False)
+        self.update_idletasks()
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        win_w, win_h = 600, min(800, screen_h - 80)
+        x = (screen_w - win_w) // 2
+        y = (screen_h - win_h) // 2
+        self.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        self.minsize(480, 500)
+        self.resizable(True, True)
 
         self.video_duration = None
         self._syncing = False
@@ -24,11 +31,15 @@ class ClipperApp(ctk.CTk):
         ctk.CTkLabel(self, text="🎬 YouTube Clipper",
                      font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(25, 5))
         ctk.CTkLabel(self, text="Download a high-quality clip from any YouTube video",
-                     font=ctk.CTkFont(size=13), text_color="gray").pack(pady=(0, 20))
+                     font=ctk.CTkFont(size=13), text_color="gray").pack(pady=(0, 10))
 
-        card = ctk.CTkFrame(self, corner_radius=16)
-        card.pack(padx=25, pady=5, fill="both", expand=True)
+        # Scrollable card: content can never get clipped off-screen again
+        card = ctk.CTkScrollableFrame(self, corner_radius=16)
+        card.pack(padx=25, pady=(0, 20), fill="both", expand=True)
 
+        self.bind("<F11>", lambda e: self.attributes("-fullscreen", not self.attributes("-fullscreen")))
+        self.bind("<Escape>", lambda e: self.attributes("-fullscreen", False))
+        
         # URL + Load
         ctk.CTkLabel(card, text="Video URL", anchor="w").pack(fill="x", padx=20, pady=(20, 5))
         url_row = ctk.CTkFrame(card, fg_color="transparent")
