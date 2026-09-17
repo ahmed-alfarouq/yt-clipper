@@ -1,3 +1,4 @@
+import socket
 import io
 import itertools
 import math
@@ -382,6 +383,8 @@ class ClipperApp(ctk.CTk):
         if not thumbnail_url or Image is None:
             return None, bool(thumbnail_url)
 
+        previous_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(6)
         try:
             request = urllib.request.Request(
                 thumbnail_url,
@@ -395,6 +398,8 @@ class ClipperApp(ctk.CTk):
             return image, False
         except Exception:
             return None, True
+        finally:
+            socket.setdefaulttimeout(previous_timeout)
 
     def _show_load_progress(self):
         if not self.load_progress.winfo_manager():
@@ -434,6 +439,9 @@ class ClipperApp(ctk.CTk):
             text_color="#4da6ff",
         )
         self.update_clip_length()
+        self.load_btn.configure(state="normal", text="Load Video")
+        self._hide_load_progress()
+        self.set_status("Video loaded. Fetching thumbnail...", "#4da6ff")
 
     def _apply_suggested_filename(self, title):
         current = self.output_entry.get().strip()
