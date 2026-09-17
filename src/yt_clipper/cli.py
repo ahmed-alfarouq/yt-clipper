@@ -1,0 +1,33 @@
+import argparse
+import sys
+from yt_clipper.core import downloader
+from yt_clipper.core.utils import time_to_seconds
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Download a clip from a YouTube video")
+    parser.add_argument("url")
+    parser.add_argument("start", nargs="?")
+    parser.add_argument("end", nargs="?")
+    parser.add_argument("-o", "--output", default="clip.mp4")
+    parser.add_argument("-q", "--quality", default="best", choices=["best", "4k", "1080p", "720p"])
+    parser.add_argument("--list-formats", action="store_true")
+    args = parser.parse_args()
+
+    try:
+        if args.list_formats:
+            for f in downloader.list_formats(args.url):
+                print(f"{f['format_id']}: {f['height']}p, {f['ext']}, {f['vbr']}kbps")
+            return
+        if not args.start or not args.end:
+            parser.error("start and end times are required unless using --list-formats")
+        downloader.download_clip(args.url, time_to_seconds(args.start), time_to_seconds(args.end),
+                                  args.output, args.quality)
+        print(f"✅ Saved to {args.output}")
+    except Exception as e:
+        print(f"❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
