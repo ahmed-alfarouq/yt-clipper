@@ -1,4 +1,11 @@
+import os
+from typing import Any, cast
+
 import yt_dlp
+from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
+
+from yt_clipper.core.ffmpeg_runner import DownloadCancelled, run_ffmpeg_clip
+
 
 FORMAT_MAP = {
     "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
@@ -8,38 +15,131 @@ FORMAT_MAP = {
 }
 
 
-def get_video_info(url):
-    """Returns {'title': ..., 'duration': seconds} without downloading."""
-    with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+def _extract_info(url, options=None):
+    """Extract one video's information without downloading it."""
+    ydl_options: dict[str, Any] = {
+        "quiet": True,
+        "noplaylist": True,
+    }
+    if options:
+        ydl_options.update(options)
+
+    with yt_dlp.YoutubeDL(cast(Any, ydl_options)) as ydl:
         info = ydl.extract_info(url, download=False)
-    return {"title": info.get("title", "Unknown title"), "duration": info.get("duration", 0)}
+    if info is None:
+        raise ValueError(f"Could not fetch video info for: {url}")
+    _reject_playlist(info)
+    return info
+
+
+def _reject_playlist(info):
+    if info.get("_type") == "playlist" or "entries" in info:
+        raise ValueError(
+            "This looks like a playlist URL. Paste a link to a single video."
+        )
+
+
+def get_video_info(url):
+    info = _extract_info(url)
+    return {
+        "title": info.get("title", "Unknown title"),
+        "duration": info.get("duration", 0),
+        "thumbnail": info.get("thumbnail"),
+    }
 
 
 def list_formats(url):
-    with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-        info = ydl.extract_info(url, download=False)
+    info = _extract_info(url)
+    formats = info.get("formats") or []
     return [
-        {"format_id": f["format_id"], "height": f.get("height"),
-         "ext": f.get("ext"), "vbr": f.get("vbr")}
-        for f in info["formats"] if f.get("vcodec") != "none"
+        {
+            "format_id": media_format.get("format_id"),
+            "height": media_format.get("height"),
+            "ext": media_format.get("ext"),
+            "vbr": media_format.get("vbr"),
+        }
+        for media_format in formats
+        if media_format.get("vcodec") != "none"
     ]
 
 
-def download_clip(url, start_sec, end_sec, output_path="clip.mp4",
-                   quality="best", progress_hook=None):
+def download_clip(
+    url,
+    start_sec,
+    end_sec,
+    output_path="clip.mp4",
+    quality="best",
+    audio_only=False,
+    progress_hook=None,
+    cancel_event=None,
+):
+    """Download one time range with observable FFmpeg progress.
+
+    yt-dlp selects and authorizes the source formats. The actual ranged transfer
+    runs through our FFmpeg wrapper because yt-dlp's external FFmpeg downloader
+    does not publish intermediate progress hooks or expose cancellation.
+    """
     if end_sec <= start_sec:
         raise ValueError("End time must be after start time")
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelled("Download cancelled")
 
-    ydl_opts = {
-        'format': FORMAT_MAP.get(quality, FORMAT_MAP["best"]),
-        'outtmpl': output_path,
-        'download_ranges': yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)]),
-        'force_keyframes_at_cuts': True,
-        'merge_output_format': 'mp4',
-        'quiet': True,
+    if audio_only:
+        base, _extension = os.path.splitext(output_path)
+        output_path = base + ".mp3"
+
+    ydl_options: dict[str, Any] = {
+        "quiet": True,
+        "noplaylist": True,
+        "format": "bestaudio/best" if audio_only else FORMAT_MAP.get(
+            quality, FORMAT_MAP["best"]
+        ),
     }
-    if progress_hook:
-        ydl_opts['progress_hooks'] = [progress_hook]
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    with yt_dlp.YoutubeDL(cast(Any, ydl_options)) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if info is None:
+            raise ValueError(f"Could not fetch video info for: {url}")
+        _reject_playlist(info)
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled("Download cancelled")
+
+        selected_formats = info.get("requested_formats") or [info]
+        shared_headers = info.get("http_headers") or {}
+        formats = []
+        for selected_format in selected_formats:
+            media_format = dict(selected_format)
+            if shared_headers and not media_format.get("http_headers"):
+                media_format["http_headers"] = shared_headers
+            formats.append(media_format)
+
+        ffmpeg = FFmpegPostProcessor(downloader=ydl)
+        if not ffmpeg.available:
+            raise RuntimeError(
+                "FFmpeg was not found. Install FFmpeg and make it available on PATH."
+            )
+        ffmpeg.check_version()
+
+        run_ffmpeg_clip(
+            executable=ffmpeg.executable,
+            formats=formats,
+            output_path=output_path,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            audio_only=audio_only,
+            progress_hook=progress_hook,
+            cancel_event=cancel_event,
+            cookiejar=ydl.cookiejar,
+            proxy=ydl.params.get("proxy"),
+        )
+
+    return output_path
+
+
+__all__ = [
+    "DownloadCancelled",
+    "download_clip",
+    "get_video_info",
+    "list_formats",
+]
