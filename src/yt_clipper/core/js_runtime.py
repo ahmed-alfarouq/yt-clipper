@@ -51,3 +51,32 @@ def find_available_runtime():
         if shutil.which(name):
             return name
     return None
+
+
+def build_ydl_js_runtime_option():
+    """Best-effort ydl_options["js_runtimes"] value that tells yt-dlp to
+    actually USE whatever supported runtime we found on PATH.
+
+    This exists because of a real gotcha: yt-dlp only auto-enables "deno"
+    out of the box. Every other supported runtime (node, bun, qjs) is
+    disabled by default *even when installed and discoverable on PATH*,
+    purely as a security precaution - yt-dlp keeps warning "No supported
+    JavaScript runtime could be found" until it's explicitly told to use
+    one, exactly like passing `--js-runtimes NAME` on the CLI. So
+    find_available_runtime() finding "node" does NOT by itself mean yt-dlp
+    will use it; this function is what actually flips that on.
+
+    Returns None if nothing was found, so callers can do
+    `ydl_options.update(js_runtime.build_ydl_js_runtime_option() or {})`.
+
+    NOTE: `js_runtimes` is not part of yt-dlp's documented, stable Python
+    API - this shape ({"runtime_name": {}}) was confirmed by inspecting
+    yt-dlp's own debug params dump, not from official API docs, so it could
+    change in a future release. Deno is always included alongside whatever
+    else was found (not just the found one) so this can never accidentally
+    take away deno's own default-enabled status.
+    """
+    found = find_available_runtime()
+    if found is None:
+        return None
+    return {"js_runtimes": {"deno": {}, found: {}}}

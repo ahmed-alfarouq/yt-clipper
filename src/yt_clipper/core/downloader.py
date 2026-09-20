@@ -8,6 +8,7 @@ import yt_dlp.utils  # explicit submodule import so `yt_dlp.utils.DownloadError`
 from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 
 from yt_clipper.core.ffmpeg_runner import DownloadCancelled, run_ffmpeg_clip
+from yt_clipper.core.js_runtime import build_ydl_js_runtime_option
 
 
 FORMAT_MAP = {
@@ -89,6 +90,7 @@ def _extract_info(url, options=None, cancel_event=None, on_retry=None):
         "quiet": True,
         "noplaylist": True,
     }
+    ydl_options.update(build_ydl_js_runtime_option() or {})
     if options:
         ydl_options.update(options)
 
@@ -137,6 +139,7 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
         "quiet": True,
         "extract_flat": "in_playlist",
     }
+    ydl_options.update(build_ydl_js_runtime_option() or {})
     if max_videos:
         ydl_options["playlistend"] = max_videos
 
@@ -306,6 +309,7 @@ def download_clip(
         "noplaylist": True,
         "format": format_selector,
     }
+    ydl_options.update(build_ydl_js_runtime_option() or {})
 
     def _notify_retry(attempt, max_attempts, delay, exc):
         if progress_hook:
