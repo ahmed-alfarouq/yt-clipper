@@ -8,13 +8,14 @@ import customtkinter as ctk
 from tkinter import messagebox
 
 from yt_clipper.core import config as app_config
-from yt_clipper.core.utils import format_seconds
+from yt_clipper.core.utils import format_seconds, sanitize_filename
 from yt_clipper.gui.models import DownloadJob
 
 STATUS_COLORS = {
     "Queued": "gray",
     "Waiting": "#b0bec5",
     "Downloading": "#4da6ff",
+    "Retrying": "#e6a817",
     "Processing": "#e6a817",
     "Done": "#4caf50",
     "Error": "#e05252",
@@ -50,19 +51,6 @@ class QueueController:
             )
             return
 
-        if app.loaded_url == url and app.video_duration is not None:
-            if end_sec > app.video_duration:
-                messagebox.showerror(
-                    "Invalid range",
-                    "End time cannot be later than the loaded video's duration.",
-                )
-                return
-            label = app.loaded_title or url
-        else:
-            # A manually entered URL remains supported, but metadata from a
-            # previously loaded URL is never reused for it.
-            label = url
-
         audio_only = app.audio_only_var.get()
         raw_output = app.output_entry.get().strip()
         if not raw_output:
@@ -77,6 +65,26 @@ class QueueController:
                 f"The output folder could not be created:\n{exc}",
             )
             return
+
+        if app.loaded_url == url and app.loaded_playlist_entries:
+            self._enqueue_playlist(
+                app.loaded_playlist_entries, start_sec, end_sec, audio_only, requested_path
+            )
+            self.reset_fields()
+            return
+
+        if app.loaded_url == url and app.video_duration is not None:
+            if end_sec > app.video_duration:
+                messagebox.showerror(
+                    "Invalid range",
+                    "End time cannot be later than the loaded video's duration.",
+                )
+                return
+            label = app.loaded_title or url
+        else:
+            # A manually entered URL remains supported, but metadata from a
+            # previously loaded URL is never reused for it.
+            label = url
 
         output_path = self._unique_output_path(requested_path)
         job = DownloadJob(
@@ -109,6 +117,45 @@ class QueueController:
         app.app_config["last_output_dir"] = str(output_path.parent)
         app_config.save_config(app.app_config)
         self.reset_fields()
+
+    def _enqueue_playlist(self, entries, start_sec, end_sec, audio_only, requested_path):
+        """Queue one job per playlist video, all sharing the same clip range.
+
+        Filenames are numbered ("01 - <title>.<ext>") in the requested
+        output folder, since a single filename can't serve every video and
+        titles alone can collide or contain characters unsafe for a path.
+        """
+        app = self.app
+        directory = requested_path.parent
+        extension = requested_path.suffix or (".mp3" if audio_only else ".mp4")
+
+        queued_count = 0
+        for index, entry in enumerate(entries, start=1):
+            safe_title = sanitize_filename(entry.get("title") or f"video_{index}")
+            candidate = directory / f"{index:02d} - {safe_title}{extension}"
+            output_path = self._unique_output_path(candidate)
+
+            job = DownloadJob(
+                id=next(app._job_id_counter),
+                url=entry["url"],
+                label=entry.get("title") or entry["url"],
+                start_sec=start_sec,
+                end_sec=end_sec,
+                quality=app.quality_var.get(),
+                audio_only=audio_only,
+                output_path=str(output_path),
+            )
+            app.queue_jobs.append(job)
+            queued_behind_another = app.download_queue.enqueue(job)
+            # Every entry after the first is necessarily behind at least the
+            # one before it, even if the queue was otherwise idle.
+            job.status = "Waiting" if (queued_behind_another or index > 1) else "Queued"
+            queued_count += 1
+
+        self.render_queue()
+        app.app_config["last_output_dir"] = str(directory)
+        app_config.save_config(app.app_config)
+        app.set_status(f"Queued {queued_count} clips from playlist", "#4da6ff")
 
     def _unique_output_path(self, requested_path):
         app = self.app
@@ -230,6 +277,13 @@ class QueueController:
     def _apply_download_progress(self, job_id, data):
         status = data.get("status")
         if status == "downloading":
+            # A prior "retrying" event may have left job.status stuck there;
+            # a normal progress event means the attempt is actually running.
+            job = self._find_job(job_id)
+            if job is not None and job.status != "Downloading":
+                job.status = "Downloading"
+                self.render_queue()
+
             progress = self._progress_fraction(data)
             percent_text = self._clean_percent_text(data.get("_percent_str", ""))
             downloaded_text = self._clean_percent_text(
@@ -275,6 +329,22 @@ class QueueController:
                 job_id,
                 None,
                 "Processing/merging...",
+                "#e6a817",
+            )
+        elif status == "retrying":
+            job = self._find_job(job_id)
+            if job is not None:
+                job.status = "Retrying"
+                self.render_queue()
+            attempt = data.get("attempt")
+            max_attempts = data.get("max_attempts")
+            delay = data.get("delay") or 0
+            error_text = data.get("error") or ""
+            self._apply_job_progress(
+                job_id,
+                None,
+                f"⚠ Network hiccup, retrying ({attempt}/{max_attempts}) "
+                f"in {delay:.0f}s: {error_text}",
                 "#e6a817",
             )
 
@@ -413,17 +483,6 @@ class QueueController:
         app.url_entry.delete(0, "end")
         app.loaded_url = None
         app.loaded_title = None
+        app.loaded_playlist_entries = None
         app.video_duration = None
         app.video_loader._set_thumbnail(None, False)
-        app.video_info_label.configure(text="No video loaded yet", text_color="gray")
-
-        app.start_slider.configure(to=100, state="disabled")
-        app.end_slider.configure(to=100, state="disabled")
-        app.start_slider.set(0)
-        app.end_slider.set(100)
-        app.start_input.set_seconds(0)
-        app.end_input.set_seconds(0)
-        app.clip_length_label.configure(text="Clip length: —")
-
-        app.output_entry.delete(0, "end")
-        app.output_entry.insert(0, str(app._default_output_path()))

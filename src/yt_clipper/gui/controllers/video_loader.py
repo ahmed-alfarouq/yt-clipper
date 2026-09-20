@@ -53,8 +53,25 @@ class VideoLoaderController:
     def _load_video_worker(self, request_id, url):
         app = self.app
         try:
-            info = downloader.get_video_info(url)
-            duration = info.get("duration")
+            def _notify_retry(attempt, max_attempts, delay, exc):
+                app._post_ui_event(
+                    "video_retry", request_id, attempt, max_attempts, delay, str(exc)
+                )
+
+            result = downloader.expand_playlist(url, on_retry=_notify_retry)
+
+            if result["is_playlist"]:
+                app._post_ui_event(
+                    "playlist_metadata",
+                    request_id,
+                    url,
+                    result.get("playlist_title") or "Playlist",
+                    result["entries"],
+                )
+                return
+
+            entry = result["entries"][0]
+            duration = entry.get("duration")
             if (
                 not isinstance(duration, (int, float))
                 or isinstance(duration, bool)
@@ -65,7 +82,7 @@ class VideoLoaderController:
                     "This video has no usable duration. Live streams are not supported."
                 )
 
-            title = str(info.get("title") or "Unknown title")
+            title = str(entry.get("title") or "Unknown title")
             app._post_ui_event(
                 "video_metadata",
                 request_id,
@@ -74,7 +91,7 @@ class VideoLoaderController:
                 float(duration),
             )
 
-            thumbnail, thumbnail_failed = self._fetch_thumbnail(info.get("thumbnail"))
+            thumbnail, thumbnail_failed = self._fetch_thumbnail(entry.get("thumbnail"))
             app._post_ui_event(
                 "video_thumbnail",
                 request_id,
@@ -126,6 +143,56 @@ class VideoLoaderController:
 
     # ---------- Event handlers (called from app._handle_ui_event) ----------
 
+    def _apply_video_retry(self, request_id, attempt, max_attempts, delay, error_text):
+        app = self.app
+        if request_id != app._load_request_id:
+            return
+        app.video_info_label.configure(
+            text=(
+                f"⚠ Network hiccup, retrying ({attempt}/{max_attempts}) "
+                f"in {delay:.0f}s...\n{error_text}"
+            ),
+            text_color="#e6a817",
+        )
+        app.set_status(f"Retrying video load ({attempt}/{max_attempts})...", "#e6a817")
+
+    def _apply_playlist_metadata(self, request_id, url, playlist_title, entries):
+        app = self.app
+        if request_id != app._load_request_id:
+            return
+
+        app.loaded_url = url
+        app.loaded_title = playlist_title
+        app.loaded_playlist_entries = entries
+        app.video_duration = None  # no single duration; the same typed range
+                                    # is applied to every video in the playlist
+
+        self._set_thumbnail(None, False)
+        app.start_slider.configure(to=100, state="disabled")
+        app.end_slider.configure(to=100, state="disabled")
+        app.start_slider.set(0)
+        app.end_slider.set(100)
+        # Deliberately leave the H/M/S steppers as the user set them - that
+        # typed range is what gets applied to every video in the playlist.
+
+        self._apply_suggested_filename(playlist_title)
+
+        app.video_info_label.configure(
+            text=(
+                f"📃  {playlist_title}\n"
+                f"{len(entries)} videos in playlist\n"
+                "The same start/end time will be clipped from every video."
+            ),
+            text_color="#4caf50",
+        )
+        app.load_btn.configure(state="normal", text="Load Video")
+        self._hide_load_progress()
+        app.set_status(
+            f"Playlist loaded ({len(entries)} videos). "
+            "Choose a time range and add it to the queue.",
+            "#4caf50",
+        )
+
     def _apply_video_metadata(self, request_id, url, title, duration):
         app = self.app
         if request_id != app._load_request_id:
@@ -134,6 +201,7 @@ class VideoLoaderController:
         app.video_duration = duration
         app.loaded_url = url
         app.loaded_title = title
+        app.loaded_playlist_entries = None
         self._apply_suggested_filename(title)
 
         app.start_slider.configure(to=duration, state="normal")
@@ -200,6 +268,7 @@ class VideoLoaderController:
         app.video_duration = None
         app.loaded_url = None
         app.loaded_title = None
+        app.loaded_playlist_entries = None
         self._set_thumbnail(None, False)
         self._hide_load_progress()
         app.video_info_label.configure(

@@ -39,6 +39,7 @@ class ClipperApp(ctk.CTk):
         self.video_duration = None
         self.loaded_url = None
         self.loaded_title = None
+        self.loaded_playlist_entries = None
         self._syncing = False
         self._closing = False
         self._load_request_id = 0
@@ -292,6 +293,10 @@ class ClipperApp(ctk.CTk):
             self.video_loader._apply_video_thumbnail(*payload)
         elif event_name == "video_error":
             self.video_loader._apply_video_error(*payload)
+        elif event_name == "video_retry":
+            self.video_loader._apply_video_retry(*payload)
+        elif event_name == "playlist_metadata":
+            self.video_loader._apply_playlist_metadata(*payload)
         elif event_name == "job_started":
             self.queue_controller._apply_job_started(*payload)
         elif event_name == "download_progress":
