@@ -5,7 +5,7 @@ import customtkinter as ctk
 
 from yt_clipper.core import updater
 
-CURRENT_VERSION = "1.1.0"
+CURRENT_VERSION = "1.2.0"
 UPDATE_OWNER = "ahmed-alfarouq"
 UPDATE_REPO = "yt-clipper"
 
