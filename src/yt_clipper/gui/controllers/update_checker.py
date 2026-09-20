@@ -40,7 +40,11 @@ class UpdateChecker:
         app.banner_container.pack(
             fill="x",
             side="top",
-            before=app.header_label,
+            # title_row is a direct child of `self`, same as banner_container,
+            # so Tk's `before` option (which requires a shared parent) is
+            # valid here. header_label itself now lives inside title_row,
+            # not directly under `self`, so it can no longer be used here.
+            before=app.title_row,
         )
         banner = ctk.CTkFrame(
             app.banner_container,

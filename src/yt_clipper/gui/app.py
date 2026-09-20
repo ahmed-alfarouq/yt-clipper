@@ -10,6 +10,7 @@ from tkinter import filedialog
 from yt_clipper.core import config as app_config
 from yt_clipper.core.utils import format_seconds
 from yt_clipper.gui.controllers import VideoLoaderController, QueueController, UpdateChecker
+from yt_clipper.gui.controllers.update_checker import CURRENT_VERSION
 from yt_clipper.gui.controllers.video_loader import THUMBNAIL_SIZE
 from yt_clipper.gui.services import SequentialDownloadQueue
 from yt_clipper.gui.widgets.time_input import TimeInput
@@ -72,12 +73,28 @@ class ClipperApp(ctk.CTk):
         # as a large blank area above the title.
         self.banner_container = ctk.CTkFrame(self, fg_color="transparent")
 
+        # title_row holds the header + version label side by side, and is
+        # itself a direct child of `self` (same as banner_container), so
+        # banner_container.pack(before=self.title_row) is valid — Tk's
+        # `before` option requires both widgets to share the same parent.
+        title_row = ctk.CTkFrame(self, fg_color="transparent")
+        title_row.pack(pady=(10, 5))
+        self.title_row = title_row
+
         self.header_label = ctk.CTkLabel(
-            self,
+            title_row,
             text="🎬 YouTube Clipper",
             font=ctk.CTkFont(size=24, weight="bold"),
         )
-        self.header_label.pack(pady=(10, 5))
+        self.header_label.pack(side="left")
+
+        ctk.CTkLabel(
+            title_row,
+            text=f"v{CURRENT_VERSION}",
+            font=ctk.CTkFont(size=12),
+            text_color="gray50",
+        ).pack(side="left", padx=(8, 0), pady=(8, 0))
+
         ctk.CTkLabel(
             self,
             text="Download a high-quality clip from any YouTube video",
