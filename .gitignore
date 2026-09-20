@@ -4,6 +4,7 @@ __pycache__/
 build/
 dist/
 *.spec
+/runtimes/
 *.mp4
 *.mkv
 .vscode/

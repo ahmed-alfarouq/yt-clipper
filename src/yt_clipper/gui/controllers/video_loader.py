@@ -61,12 +61,18 @@ class VideoLoaderController:
             result = downloader.expand_playlist(url, on_retry=_notify_retry)
 
             if result["is_playlist"]:
+                entries = result["entries"]
                 app._post_ui_event(
                     "playlist_metadata",
                     request_id,
                     url,
                     result.get("playlist_title") or "Playlist",
-                    result["entries"],
+                    entries,
+                )
+                first_thumbnail_url = entries[0].get("thumbnail") if entries else None
+                thumbnail, thumbnail_failed = self._fetch_thumbnail(first_thumbnail_url)
+                app._post_ui_event(
+                    "playlist_thumbnail", request_id, thumbnail, thumbnail_failed
                 )
                 return
 
@@ -164,16 +170,14 @@ class VideoLoaderController:
         app.loaded_url = url
         app.loaded_title = playlist_title
         app.loaded_playlist_entries = entries
-        app.video_duration = None  # no single duration; the same typed range
-                                    # is applied to every video in the playlist
+        app.video_duration = None  # no single duration; every video in the
+                                    # playlist is downloaded in full instead
 
         self._set_thumbnail(None, False)
-        app.start_slider.configure(to=100, state="disabled")
-        app.end_slider.configure(to=100, state="disabled")
-        app.start_slider.set(0)
-        app.end_slider.set(100)
-        # Deliberately leave the H/M/S steppers as the user set them - that
-        # typed range is what gets applied to every video in the playlist.
+        # Start/End Time have no meaning for a full-playlist download, so
+        # they're hidden entirely rather than disabled - there's nothing
+        # for the user to set here.
+        app.set_time_range_visible(False)
 
         self._apply_suggested_filename(playlist_title)
 
@@ -181,16 +185,35 @@ class VideoLoaderController:
             text=(
                 f"📃  {playlist_title}\n"
                 f"{len(entries)} videos in playlist\n"
-                "The same start/end time will be clipped from every video."
+                "Each video will be downloaded in full • Fetching a preview thumbnail..."
             ),
             text_color="#4caf50",
         )
         app.load_btn.configure(state="normal", text="Load Video")
         self._hide_load_progress()
         app.set_status(
-            f"Playlist loaded ({len(entries)} videos). "
-            "Choose a time range and add it to the queue.",
+            f"Playlist loaded ({len(entries)} videos). Click Download to queue them all.",
             "#4caf50",
+        )
+
+    def _apply_playlist_thumbnail(self, request_id, thumbnail, thumbnail_failed):
+        app = self.app
+        if request_id != app._load_request_id:
+            return
+
+        self._set_thumbnail(thumbnail, thumbnail_failed)
+        entries = app.loaded_playlist_entries or []
+        thumbnail_note = (
+            " • Preview thumbnail unavailable" if thumbnail_failed
+            else " • Showing the first video's thumbnail"
+        )
+        app.video_info_label.configure(
+            text=(
+                f"📃  {app.loaded_title}\n"
+                f"{len(entries)} videos in playlist\n"
+                f"Each video will be downloaded in full{thumbnail_note}"
+            ),
+            text_color="#4caf50",
         )
 
     def _apply_video_metadata(self, request_id, url, title, duration):
@@ -202,6 +225,9 @@ class VideoLoaderController:
         app.loaded_url = url
         app.loaded_title = title
         app.loaded_playlist_entries = None
+        # A single video always uses a time range, even if the previous
+        # load was a playlist that hid these fields.
+        app.set_time_range_visible(True)
         self._apply_suggested_filename(title)
 
         app.start_slider.configure(to=duration, state="normal")
@@ -271,6 +297,9 @@ class VideoLoaderController:
         app.loaded_playlist_entries = None
         self._set_thumbnail(None, False)
         self._hide_load_progress()
+        # A failed load might follow a previously loaded playlist that hid
+        # these fields - restore them so the UI isn't left looking broken.
+        app.set_time_range_visible(True)
         app.video_info_label.configure(
             text=f"❌ Couldn't load video: {error_message}",
             text_color="#e05252",
@@ -279,16 +308,36 @@ class VideoLoaderController:
         app.set_status("Video information could not be loaded.", "#e05252")
 
     def _set_thumbnail(self, image, failed):
-        app = self.app
-        if image is None:
-            app._thumbnail_image = None
-            app.thumbnail_label.configure(image=None, text="⚠" if failed else "")
-            return
+        """Update the thumbnail widget, or clear it back to empty/warning.
 
-        ctk_image = ctk.CTkImage(
-            light_image=image,
-            dark_image=image,
-            size=image.size,
-        )
-        app._thumbnail_image = ctk_image
-        app.thumbnail_label.configure(image=ctk_image, text="")
+        Order matters here. CTkImage's underlying Tk PhotoImage objects are
+        only kept alive by the Python reference in app._thumbnail_image. If
+        that reference is dropped (set to None) BEFORE the widget is told to
+        stop using it, CPython's refcounting GC destroys the PhotoImage
+        immediately, which deletes the underlying Tk image by name (e.g.
+        "pyimage1") - and the *next* widget redraw then fails with
+        `_tkinter.TclError: image "pyimageN" does not exist`, since the
+        widget's C-level config still points at that now-deleted name.
+        Reconfiguring the widget first, then releasing the Python reference,
+        avoids that race entirely.
+        """
+        app = self.app
+        try:
+            if image is None:
+                app.thumbnail_label.configure(image=None, text="⚠" if failed else "")
+                app._thumbnail_image = None
+                return
+
+            ctk_image = ctk.CTkImage(
+                light_image=image,
+                dark_image=image,
+                size=image.size,
+            )
+            app.thumbnail_label.configure(image=ctk_image, text="")
+            app._thumbnail_image = ctk_image
+        except Exception:
+            # The thumbnail is a nice-to-have. A Tk/CTk quirk here must never
+            # abort the caller mid-way through applying video/playlist
+            # metadata - that would leave the Load button and progress bar
+            # stuck forever, which is worse than a missing thumbnail.
+            app._thumbnail_image = None

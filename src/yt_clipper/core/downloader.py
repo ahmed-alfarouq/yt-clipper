@@ -162,7 +162,7 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
                 "url": entry_url,
                 "title": raw_entry.get("title") or entry_url,
                 "duration": raw_entry.get("duration"),
-                "thumbnail": raw_entry.get("thumbnail"),
+                "thumbnail": _best_thumbnail_url(raw_entry),
             })
         if not entries:
             raise ValueError("This playlist has no videos, or they're all unavailable.")
@@ -182,6 +182,32 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
             "thumbnail": info.get("thumbnail"),
         }],
     }
+
+
+def _best_thumbnail_url(raw_entry):
+    """Pick a thumbnail URL out of a yt-dlp entry.
+
+    A flat (extract_flat) playlist entry almost never has the singular
+    "thumbnail" field populated - that's only reliably set after a full,
+    non-flat extraction. What it does have is a "thumbnails" list of
+    {url, width, height} dicts, so we take the largest of those. As a last
+    resort, YouTube's default thumbnail path is predictable from the video
+    id alone, so that's used if nothing else is available.
+    """
+    thumbnail = raw_entry.get("thumbnail")
+    if thumbnail:
+        return thumbnail
+
+    thumbnails = raw_entry.get("thumbnails") or []
+    if thumbnails:
+        best = max(thumbnails, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
+        if best.get("url"):
+            return best["url"]
+
+    video_id = raw_entry.get("id")
+    if video_id:
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    return None
 
 
 def list_formats(url):
@@ -237,6 +263,13 @@ def download_clip(
     runs through our FFmpeg wrapper because yt-dlp's external FFmpeg downloader
     does not publish intermediate progress hooks or expose cancellation.
 
+    start_sec/end_sec may be None to mean "the whole video": a None start_sec
+    is treated as 0, and a None end_sec is resolved from the video's own
+    duration once it's known (during the same extraction that already
+    happens below). This is what full-video playlist downloads use, so no
+    separate "download the whole thing" code path exists - it's just a clip
+    whose range happens to be the entire video.
+
     format_id, when given, is passed straight through as a yt-dlp format
     selector (see `list_formats`) and takes priority over `quality`. It can
     name a single format_id (only valid if that format already has both
@@ -252,7 +285,7 @@ def download_clip(
     event before each retry so the caller can surface it instead of the
     retry happening silently.
     """
-    if end_sec <= start_sec:
+    if start_sec is not None and end_sec is not None and end_sec <= start_sec:
         raise ValueError("End time must be after start time")
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled("Download cancelled")
@@ -303,6 +336,22 @@ def download_clip(
             if cancel_event is not None and cancel_event.is_set():
                 raise DownloadCancelled("Download cancelled")
 
+            # Resolve a full-video range using this video's own duration,
+            # now that we actually have it - this is the only place that
+            # needs to know about "None means full video".
+            resolved_start = 0.0 if start_sec is None else float(start_sec)
+            if end_sec is None:
+                duration = info.get("duration")
+                if not isinstance(duration, (int, float)) or duration <= 0:
+                    raise ValueError(
+                        "Could not determine this video's duration to download it in full."
+                    )
+                resolved_end = float(duration)
+            else:
+                resolved_end = float(end_sec)
+            if resolved_end <= resolved_start:
+                raise ValueError("End time must be after start time")
+
             selected_formats = info.get("requested_formats") or [info]
             shared_headers = info.get("http_headers") or {}
             formats = []
@@ -323,8 +372,8 @@ def download_clip(
                 executable=ffmpeg.executable,
                 formats=formats,
                 output_path=output_path,
-                start_sec=start_sec,
-                end_sec=end_sec,
+                start_sec=resolved_start,
+                end_sec=resolved_end,
                 audio_only=audio_only,
                 progress_hook=progress_hook,
                 cancel_event=cancel_event,

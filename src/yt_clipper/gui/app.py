@@ -2,12 +2,14 @@ import os
 import queue
 import threading
 import traceback
+import webbrowser
 from pathlib import Path
 
 import customtkinter as ctk
 from tkinter import filedialog
 
 from yt_clipper.core import config as app_config
+from yt_clipper.core import js_runtime
 from yt_clipper.core.utils import format_seconds
 from yt_clipper.gui.controllers import VideoLoaderController, QueueController, UpdateChecker
 from yt_clipper.gui.controllers.update_checker import CURRENT_VERSION
@@ -25,6 +27,11 @@ UI_POLL_INTERVAL_MS = 50
 class ClipperApp(ctk.CTk):
     def __init__(self):
         super().__init__()
+        # Must happen before any yt-dlp call in this process, so a bundled
+        # portable runtime (if shipped) is on PATH by the time yt-dlp's own
+        # auto-detection runs. A no-op if no runtimes/ folder is shipped.
+        js_runtime.ensure_bundled_runtime_on_path()
+
         self.title("YouTube Clipper")
         self.update_idletasks()
 
@@ -72,6 +79,11 @@ class ClipperApp(ctk.CTk):
         # has a non-trivial default requested height, which otherwise appears
         # as a large blank area above the title.
         self.banner_container = ctk.CTkFrame(self, fg_color="transparent")
+
+        # A second, independent banner container for the JS-runtime hint
+        # below, kept separate from banner_container so the two can never
+        # destroy each other's contents if both happen to fire close together.
+        self.runtime_banner_container = ctk.CTkFrame(self, fg_color="transparent")
 
         # title_row holds the header + version label side by side, and is
         # itself a direct child of `self` (same as banner_container), so
@@ -161,12 +173,21 @@ class ClipperApp(ctk.CTk):
             mode="indeterminate",
         )
 
+        # Start/End Time live together in one container so the whole block
+        # can be hidden as a unit for playlist downloads (which use no time
+        # range - every video downloads in full) and shown again for a
+        # single video, without touching each widget's own layout below.
+        self.time_range_section = ctk.CTkFrame(card, fg_color="transparent")
+        self.time_range_section.pack(fill="x", after=self.info_row)
+
         # Start time.
-        ctk.CTkLabel(card, text="Start Time", anchor="w").pack(fill="x", padx=20)
-        self.start_input = TimeInput(card, on_change=self.on_start_change)
+        ctk.CTkLabel(self.time_range_section, text="Start Time", anchor="w").pack(
+            fill="x", padx=20
+        )
+        self.start_input = TimeInput(self.time_range_section, on_change=self.on_start_change)
         self.start_input.pack(padx=20, pady=(5, 5))
         self.start_slider = ctk.CTkSlider(
-            card,
+            self.time_range_section,
             from_=0,
             to=100,
             state="disabled",
@@ -176,11 +197,13 @@ class ClipperApp(ctk.CTk):
         self.start_slider.pack(fill="x", padx=20, pady=(0, 15))
 
         # End time.
-        ctk.CTkLabel(card, text="End Time", anchor="w").pack(fill="x", padx=20)
-        self.end_input = TimeInput(card, on_change=self.on_end_change)
+        ctk.CTkLabel(self.time_range_section, text="End Time", anchor="w").pack(
+            fill="x", padx=20
+        )
+        self.end_input = TimeInput(self.time_range_section, on_change=self.on_end_change)
         self.end_input.pack(padx=20, pady=(5, 5))
         self.end_slider = ctk.CTkSlider(
-            card,
+            self.time_range_section,
             from_=0,
             to=100,
             state="disabled",
@@ -190,7 +213,7 @@ class ClipperApp(ctk.CTk):
         self.end_slider.pack(fill="x", padx=20, pady=(0, 5))
 
         self.clip_length_label = ctk.CTkLabel(
-            card,
+            self.time_range_section,
             text="Clip length: —",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#4da6ff",
@@ -275,6 +298,61 @@ class ClipperApp(ctk.CTk):
 
         self.after(UI_POLL_INTERVAL_MS, self._poll_ui_events)
         self.after(500, self.update_checker.check_update_async)
+        self.after(500, self._check_js_runtime_async)
+
+    # ---------- JS runtime (Deno/EJS) hint ----------
+
+    def _check_js_runtime_async(self):
+        threading.Thread(target=self._check_js_runtime_worker, daemon=True).start()
+
+    def _check_js_runtime_worker(self):
+        # Pure local PATH lookups - no network, so this can just post
+        # straight to the UI queue like any other background-thread result.
+        if js_runtime.find_available_runtime() is None:
+            self._post_ui_event("js_runtime_missing")
+
+    def _show_js_runtime_banner(self):
+        for widget in self.runtime_banner_container.winfo_children():
+            widget.destroy()
+
+        self.runtime_banner_container.pack(fill="x", side="top", before=self.title_row)
+        banner = ctk.CTkFrame(
+            self.runtime_banner_container,
+            fg_color="#8a5a2d",
+            corner_radius=0,
+        )
+        banner.pack(fill="x")
+        ctk.CTkLabel(
+            banner,
+            text=(
+                "⚠ No JS runtime (Deno) found — some video qualities may be "
+                "unavailable. Click for install instructions."
+            ),
+            text_color="white",
+            wraplength=440,
+            justify="left",
+        ).pack(side="left", padx=15, pady=8, fill="x", expand=True)
+        ctk.CTkButton(
+            banner,
+            text="Install Deno",
+            width=110,
+            height=28,
+            command=lambda: webbrowser.open(js_runtime.DENO_INSTALL_URL),
+        ).pack(side="right", padx=(0, 10), pady=8)
+        ctk.CTkButton(
+            banner,
+            text="✕",
+            width=28,
+            height=28,
+            fg_color="transparent",
+            hover_color="#6e4823",
+            command=self._dismiss_js_runtime_banner,
+        ).pack(side="right", pady=8)
+
+    def _dismiss_js_runtime_banner(self):
+        for widget in self.runtime_banner_container.winfo_children():
+            widget.destroy()
+        self.runtime_banner_container.pack_forget()
 
     # ---------- Main-thread event handling ----------
 
@@ -314,6 +392,8 @@ class ClipperApp(ctk.CTk):
             self.video_loader._apply_video_retry(*payload)
         elif event_name == "playlist_metadata":
             self.video_loader._apply_playlist_metadata(*payload)
+        elif event_name == "playlist_thumbnail":
+            self.video_loader._apply_playlist_thumbnail(*payload)
         elif event_name == "job_started":
             self.queue_controller._apply_job_started(*payload)
         elif event_name == "download_progress":
@@ -328,6 +408,8 @@ class ClipperApp(ctk.CTk):
             self.queue_controller._queue_idle()
         elif event_name == "update_available":
             self.update_checker._show_update_banner(*payload)
+        elif event_name == "js_runtime_missing":
+            self._show_js_runtime_banner()
 
     def _on_close(self):
         if self._closing:
@@ -341,6 +423,19 @@ class ClipperApp(ctk.CTk):
 
     def set_status(self, text, color="gray"):
         self.status_label.configure(text=text, text_color=color)
+
+    def set_time_range_visible(self, visible):
+        """Show or hide the Start/End Time block as a single unit.
+
+        Used for single-video vs playlist detection: a playlist downloads
+        every video in full, so there is no time range to show at all.
+        """
+        if visible:
+            if not self.time_range_section.winfo_manager():
+                self.time_range_section.pack(fill="x", after=self.info_row)
+        else:
+            if self.time_range_section.winfo_manager():
+                self.time_range_section.pack_forget()
 
     def _default_output_path(self):
         configured_dir = self.app_config.get("last_output_dir")

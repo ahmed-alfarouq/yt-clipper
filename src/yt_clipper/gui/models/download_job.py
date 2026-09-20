@@ -7,8 +7,8 @@ class DownloadJob:
     id: int
     url: str
     label: str
-    start_sec: float
-    end_sec: float
+    start_sec: Optional[float]
+    end_sec: Optional[float]
     quality: str
     audio_only: bool
     output_path: str

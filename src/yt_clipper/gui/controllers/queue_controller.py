@@ -43,14 +43,6 @@ class QueueController:
             messagebox.showerror("Missing URL", "Paste a YouTube URL first.")
             return
 
-        start_sec = app.start_input.get_seconds()
-        end_sec = app.end_input.get_seconds()
-        if end_sec <= start_sec:
-            messagebox.showerror(
-                "Invalid range", "End time must be after start time."
-            )
-            return
-
         audio_only = app.audio_only_var.get()
         raw_output = app.output_entry.get().strip()
         if not raw_output:
@@ -66,11 +58,20 @@ class QueueController:
             )
             return
 
+        # Playlists ignore start/end entirely - every video downloads in
+        # full - so this branch is handled before any time-range reading
+        # or validation happens below.
         if app.loaded_url == url and app.loaded_playlist_entries:
-            self._enqueue_playlist(
-                app.loaded_playlist_entries, start_sec, end_sec, audio_only, requested_path
-            )
+            self._enqueue_playlist(app.loaded_playlist_entries, audio_only, requested_path)
             self.reset_fields()
+            return
+
+        start_sec = app.start_input.get_seconds()
+        end_sec = app.end_input.get_seconds()
+        if end_sec <= start_sec:
+            messagebox.showerror(
+                "Invalid range", "End time must be after start time."
+            )
             return
 
         if app.loaded_url == url and app.video_duration is not None:
@@ -118,8 +119,8 @@ class QueueController:
         app_config.save_config(app.app_config)
         self.reset_fields()
 
-    def _enqueue_playlist(self, entries, start_sec, end_sec, audio_only, requested_path):
-        """Queue one job per playlist video, all sharing the same clip range.
+    def _enqueue_playlist(self, entries, audio_only, requested_path):
+        """Queue one job per playlist video, each downloaded in full.
 
         Filenames are numbered ("01 - <title>.<ext>") in the requested
         output folder, since a single filename can't serve every video and
@@ -139,8 +140,8 @@ class QueueController:
                 id=next(app._job_id_counter),
                 url=entry["url"],
                 label=entry.get("title") or entry["url"],
-                start_sec=start_sec,
-                end_sec=end_sec,
+                start_sec=None,
+                end_sec=None,
                 quality=app.quality_var.get(),
                 audio_only=audio_only,
                 output_path=str(output_path),
@@ -155,7 +156,7 @@ class QueueController:
         self.render_queue()
         app.app_config["last_output_dir"] = str(directory)
         app_config.save_config(app.app_config)
-        app.set_status(f"Queued {queued_count} clips from playlist", "#4da6ff")
+        app.set_status(f"Queued {queued_count} full videos from playlist", "#4da6ff")
 
     def _unique_output_path(self, requested_path):
         app = self.app
@@ -199,7 +200,9 @@ class QueueController:
             )
             row.pack(fill="x", padx=8, pady=4)
             time_range = (
-                f"{format_seconds(job.start_sec)}–{format_seconds(job.end_sec)}"
+                "Full video"
+                if job.start_sec is None or job.end_sec is None
+                else f"{format_seconds(job.start_sec)}–{format_seconds(job.end_sec)}"
             )
             kind = "🎵 MP3" if job.audio_only else job.quality
             ctk.CTkLabel(
@@ -486,3 +489,8 @@ class QueueController:
         app.loaded_playlist_entries = None
         app.video_duration = None
         app.video_loader._set_thumbnail(None, False)
+
+        # Restore Start/End Time to visible, in case the field just cleared
+        # belonged to a playlist (which hides them) - the next URL typed in
+        # may well be a single video.
+        app.set_time_range_visible(True)
