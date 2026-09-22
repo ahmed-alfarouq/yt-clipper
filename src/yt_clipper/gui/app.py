@@ -287,6 +287,7 @@ class ClipperApp(ctk.CTk):
             command=self.queue_controller.download_clip,
             fg_color="#2e7d32",
             hover_color="#1b5e20",
+            state="disabled",
         )
         self.download_button.pack(fill="x")
 
@@ -441,6 +442,50 @@ class ClipperApp(ctk.CTk):
         if hasattr(self, 'playlist_preview') and self.playlist_preview.winfo_manager():
             return self.playlist_preview
         return self.info_row
+
+    def _has_valid_download_data(self) -> bool:
+        """Check if there is at least one valid video that can be downloaded.
+
+        Uses shared application state that is also used by preview and queue:
+        - Single video: video_duration and loaded_url present, no playlist entries
+        - Playlist: loaded_playlist_entries non-empty (already filtered for availability)
+        """
+        # Playlist case: filtered available entries
+        if self.loaded_playlist_entries is not None:
+            try:
+                return len(self.loaded_playlist_entries) > 0
+            except Exception:
+                return False
+        # Single video case
+        if self.loaded_url and self.video_duration is not None:
+            try:
+                # Ensure duration is usable
+                import math
+                if isinstance(self.video_duration, (int, float)) and not isinstance(self.video_duration, bool):
+                    if math.isfinite(self.video_duration) and self.video_duration > 0:
+                        return True
+            except Exception:
+                return False
+        return False
+
+    def update_download_button_state(self):
+        """Enable/disable download button based on validated data."""
+        try:
+            can_download = self._has_valid_download_data()
+            self.download_button.configure(state="normal" if can_download else "disabled")
+        except Exception:
+            # Never crash UI due to button state update
+            try:
+                self.download_button.configure(state="disabled")
+            except Exception:
+                pass
+
+    def set_download_enabled(self, enabled: bool):
+        """Explicitly set download button enabled/disabled."""
+        try:
+            self.download_button.configure(state="normal" if enabled else "disabled")
+        except Exception:
+            pass
 
     def show_single_preview(self):
         """Show single-video preview, hide playlist preview."""

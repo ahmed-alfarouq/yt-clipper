@@ -43,6 +43,11 @@ class VideoLoaderController:
         app._load_request_id += 1
         request_id = app._load_request_id
         app.load_btn.configure(state="disabled", text="Loading...")
+        # Disable download button immediately when new URL entered / loading starts
+        try:
+            app.set_download_enabled(False)
+        except Exception:
+            pass
 
         # Detect URL type for initial preview switching (heuristic before extraction)
         url_type = detect_youtube_url_type(url)
@@ -190,6 +195,11 @@ class VideoLoaderController:
         app = self.app
         if request_id != app._load_request_id:
             return
+        # Keep download disabled while retrying
+        try:
+            app.set_download_enabled(False)
+        except Exception:
+            pass
         try:
             app.video_info_label.configure(
                 text=(
@@ -283,6 +293,15 @@ class VideoLoaderController:
 
         app.load_btn.configure(state="normal", text="Load Video")
         self._hide_load_progress()
+        # Update download button based on validated filtered data
+        try:
+            app.update_download_button_state()
+        except Exception:
+            try:
+                app.set_download_enabled(bool(sorted_entries))
+            except Exception:
+                pass
+
         if not sorted_entries:
             app.set_status(
                 f"Playlist loaded but no available videos (all unavailable)",
@@ -365,6 +384,14 @@ class VideoLoaderController:
 
         app.load_btn.configure(state="normal", text="Load Video")
         self._hide_load_progress()
+        # Enable download button only when valid video data exists
+        try:
+            app.update_download_button_state()
+        except Exception:
+            try:
+                app.set_download_enabled(True)
+            except Exception:
+                pass
         app.set_status("Video loaded. Fetching thumbnail...", "#4da6ff")
 
     def _apply_suggested_filename(self, title):
@@ -402,6 +429,10 @@ class VideoLoaderController:
 
         app.load_btn.configure(state="normal", text="Load Video")
         self._hide_load_progress()
+        try:
+            app.update_download_button_state()
+        except Exception:
+            pass
         app.set_status("Video loaded. Choose a time range and add it to the queue.", "#4caf50")
 
     def _apply_video_error(self, request_id, error_message):
@@ -436,6 +467,10 @@ class VideoLoaderController:
             pass
 
         app.load_btn.configure(state="normal", text="Load Video")
+        try:
+            app.set_download_enabled(False)
+        except Exception:
+            pass
         app.set_status("Video information could not be loaded.", "#e05252")
 
     def _set_thumbnail(self, image, failed):

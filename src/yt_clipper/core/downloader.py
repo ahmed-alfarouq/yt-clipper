@@ -18,6 +18,57 @@ FORMAT_MAP = {
     "4k": "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/best[height<=2160]",
 }
 
+
+class _FilteredYtDlpLogger:
+    """Custom yt-dlp logger that suppresses expected unavailable-video INFO messages.
+
+    yt-dlp's YoutubeTab extractor emits:
+        WARNING: [youtube:tab] YouTube said: INFO - 1 unavailable video is hidden
+    This is informational and already handled by our filtering logic (unavailable
+    videos are intentionally ignored). Showing it as a WARNING confuses users.
+
+    This logger filters only that specific pattern, preserving real errors:
+    - invalid URL, auth failure, network failure, extraction failure etc.
+      are still raised as DownloadError exceptions and surfaced via UI.
+    - Other warnings are suppressed to keep UI clean (quiet=True already does),
+      but the specific unavailable-video message is explicitly ignored.
+    """
+
+    def debug(self, msg):
+        # Suppress debug output
+        pass
+
+    def info(self, msg):
+        # Suppress info
+        pass
+
+    def warning(self, msg):
+        try:
+            lower = str(msg).lower()
+            # Suppress the specific unavailable-video hidden message
+            if "unavailable video" in lower and "hidden" in lower:
+                return
+            if "youtube said" in lower and "unavailable" in lower:
+                return
+            # Also suppress generic "YouTube said: INFO - ... unavailable" patterns
+            if "youtube said: info" in lower:
+                return
+        except Exception:
+            pass
+        # For other warnings, keep suppressed (quiet behavior)
+        # If needed, could forward to stderr, but we keep UI clean
+        pass
+
+    def error(self, msg):
+        # Errors are surfaced via exceptions (DownloadError), not logger
+        # Suppress logger.error to avoid duplicate stderr output
+        # Real errors will still raise and be caught in UI
+        pass
+
+
+def _get_ydl_logger_option():
+    return {"logger": _FilteredYtDlpLogger()}
+
 DEFAULT_MAX_ATTEMPTS = 4  # 1 initial try + up to 3 retries
 DEFAULT_BASE_DELAY = 1.5  # seconds; roughly doubles each retry (1.5s, 3s, 6s...)
 
@@ -90,6 +141,7 @@ def _extract_info(url, options=None, cancel_event=None, on_retry=None):
         "quiet": True,
         "noplaylist": True,
     }
+    ydl_options.update(_get_ydl_logger_option())
     ydl_options.update(build_ydl_js_runtime_option() or {})
     if options:
         ydl_options.update(options)
@@ -159,6 +211,7 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
         # this flag is on). Value must be list of strings per yt-dlp contract.
         "extractor_args": {"youtubetab": {"approximate_date": ["true"]}},
     }
+    ydl_options.update(_get_ydl_logger_option())
     ydl_options.update(build_ydl_js_runtime_option() or {})
     # Merge extractor_args if caller/build_ydl_js_runtime_option ever adds them
     # (currently it doesn't, but keep future-proof).
@@ -353,6 +406,7 @@ def download_clip(
         "noplaylist": True,
         "format": format_selector,
     }
+    ydl_options.update(_get_ydl_logger_option())
     ydl_options.update(build_ydl_js_runtime_option() or {})
 
     def _notify_retry(attempt, max_attempts, delay, exc):

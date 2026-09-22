@@ -506,6 +506,11 @@ class QueueController:
             )
         except Exception:
             pass
+        # Disable download button when no valid data (reset state)
+        try:
+            app.set_download_enabled(False)
+        except Exception:
+            pass
 
         # Restore Start/End Time to visible, in case the field just cleared
         # belonged to a playlist (which hides them) - the next URL typed in
