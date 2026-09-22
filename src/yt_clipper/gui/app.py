@@ -10,7 +10,7 @@ from tkinter import filedialog
 
 from yt_clipper.core import config as app_config
 from yt_clipper.core import js_runtime
-from yt_clipper.core.utils import format_seconds
+from yt_clipper.core.utils import format_seconds, sanitize_filename
 from yt_clipper.gui.controllers import VideoLoaderController, QueueController, UpdateChecker
 from yt_clipper.gui.controllers.update_checker import CURRENT_VERSION
 from yt_clipper.gui.controllers.video_loader import THUMBNAIL_SIZE
@@ -572,11 +572,32 @@ class ClipperApp(ctk.CTk):
         if not isinstance(initial_dir, str) or not Path(initial_dir).is_dir():
             initial_dir = str(Path.home())
 
-        path = filedialog.asksaveasfilename(
-            defaultextension=extension,
-            filetypes=filetypes,
-            initialdir=initial_dir,
-        )
+        # Use existing video title (source of truth: self.loaded_title) as default
+        # filename in the save dialog, passing through existing sanitization pipeline.
+        initial_file = None
+        try:
+            raw_title = (self.loaded_title or "").strip()
+            if raw_title:
+                safe_stem = sanitize_filename(raw_title)
+                # Guard against empty / "None" / "undefined" after sanitization
+                if safe_stem and safe_stem.lower() not in ("none", "undefined"):
+                    initial_file = f"{safe_stem}{extension}"
+        except Exception:
+            initial_file = None
+
+        if initial_file:
+            path = filedialog.asksaveasfilename(
+                defaultextension=extension,
+                filetypes=filetypes,
+                initialdir=initial_dir,
+                initialfile=initial_file,
+            )
+        else:
+            path = filedialog.asksaveasfilename(
+                defaultextension=extension,
+                filetypes=filetypes,
+                initialdir=initial_dir,
+            )
         if not path:
             return
 
