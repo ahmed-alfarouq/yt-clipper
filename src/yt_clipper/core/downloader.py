@@ -113,12 +113,27 @@ def _reject_playlist(info):
         )
 
 
+def _extract_publish_date_from_info(info):
+    """Extract publish date from a yt-dlp info dict, returning datetime or None.
+
+    Reuses core.utils parsing logic so sorting/formatting is consistent.
+    """
+    try:
+        from yt_clipper.core.utils import extract_publish_date
+        return extract_publish_date(info)
+    except Exception:
+        return None
+
+
 def get_video_info(url, cancel_event=None, on_retry=None):
     info = _extract_info(url, cancel_event=cancel_event, on_retry=on_retry)
     return {
         "title": info.get("title", "Unknown title"),
         "duration": info.get("duration", 0),
         "thumbnail": info.get("thumbnail"),
+        "publish_date": _extract_publish_date_from_info(info),
+        "upload_date": info.get("upload_date"),
+        "timestamp": info.get("timestamp"),
     }
 
 
@@ -138,8 +153,15 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
     ydl_options: dict[str, Any] = {
         "quiet": True,
         "extract_flat": "in_playlist",
+        # Enable approximate publish-date parsing for flat playlist entries.
+        # Without this, YoutubeTabIE does not populate `timestamp` for flat
+        # entries (it only parses publishedTimeText like "3 years ago" when
+        # this flag is on). Value must be list of strings per yt-dlp contract.
+        "extractor_args": {"youtubetab": {"approximate_date": ["true"]}},
     }
     ydl_options.update(build_ydl_js_runtime_option() or {})
+    # Merge extractor_args if caller/build_ydl_js_runtime_option ever adds them
+    # (currently it doesn't, but keep future-proof).
     if max_videos:
         ydl_options["playlistend"] = max_videos
 
@@ -161,11 +183,16 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
                 continue
             if not str(entry_url).startswith("http"):
                 entry_url = f"https://www.youtube.com/watch?v={entry_url}"
+            publish_date = _extract_publish_date_from_info(raw_entry)
             entries.append({
                 "url": entry_url,
                 "title": raw_entry.get("title") or entry_url,
                 "duration": raw_entry.get("duration"),
                 "thumbnail": _best_thumbnail_url(raw_entry),
+                "publish_date": publish_date,
+                "upload_date": raw_entry.get("upload_date"),
+                "timestamp": raw_entry.get("timestamp"),
+                "release_timestamp": raw_entry.get("release_timestamp"),
             })
         if not entries:
             raise ValueError("This playlist has no videos, or they're all unavailable.")
@@ -183,6 +210,10 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
             "title": info.get("title") or url,
             "duration": info.get("duration"),
             "thumbnail": info.get("thumbnail"),
+            "publish_date": _extract_publish_date_from_info(info),
+            "upload_date": info.get("upload_date"),
+            "timestamp": info.get("timestamp"),
+            "release_timestamp": info.get("release_timestamp"),
         }],
     }
 

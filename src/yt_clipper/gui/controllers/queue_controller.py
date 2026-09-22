@@ -489,6 +489,11 @@ class QueueController:
         app.loaded_playlist_entries = None
         app.video_duration = None
         app.video_loader._set_thumbnail(None, False)
+        # Clear new playlist preview widget as well
+        try:
+            app.playlist_preview.clear()
+        except Exception:
+            pass
 
         # Restore Start/End Time to visible, in case the field just cleared
         # belonged to a playlist (which hides them) - the next URL typed in

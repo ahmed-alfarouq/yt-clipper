@@ -16,6 +16,7 @@ from yt_clipper.gui.controllers.update_checker import CURRENT_VERSION
 from yt_clipper.gui.controllers.video_loader import THUMBNAIL_SIZE
 from yt_clipper.gui.services import SequentialDownloadQueue
 from yt_clipper.gui.widgets.time_input import TimeInput
+from yt_clipper.gui.widgets.playlist_preview import PlaylistPreviewWidget
 
 
 ctk.set_appearance_mode("dark")
@@ -146,8 +147,10 @@ class ClipperApp(ctk.CTk):
         )
         self.load_btn.pack(side="left")
 
+        # Legacy single-video preview (kept for backward compat but hidden,
+        # replaced by playlist_preview per task requirements)
         self.info_row = ctk.CTkFrame(card, fg_color="transparent")
-        self.info_row.pack(fill="x", padx=20, pady=(8, 8))
+        # Do NOT pack info_row initially; it is replaced by playlist_preview
         self.thumbnail_label = ctk.CTkLabel(
             self.info_row,
             text="",
@@ -167,6 +170,11 @@ class ClipperApp(ctk.CTk):
         )
         self.video_info_label.pack(side="left", fill="x", expand=True)
 
+        # New playlist preview widget - replaces single-video preview
+        # Placed in same general location where info_row used to be
+        self.playlist_preview = PlaylistPreviewWidget(card)
+        self.playlist_preview.pack(fill="x", padx=20, pady=(8, 8))
+
         self.load_progress = ctk.CTkProgressBar(
             card,
             height=5,
@@ -178,7 +186,7 @@ class ClipperApp(ctk.CTk):
         # range - every video downloads in full) and shown again for a
         # single video, without touching each widget's own layout below.
         self.time_range_section = ctk.CTkFrame(card, fg_color="transparent")
-        self.time_range_section.pack(fill="x", after=self.info_row)
+        self.time_range_section.pack(fill="x", after=self.playlist_preview)
 
         # Start time.
         ctk.CTkLabel(self.time_range_section, text="Start Time", anchor="w").pack(
@@ -430,9 +438,11 @@ class ClipperApp(ctk.CTk):
         Used for single-video vs playlist detection: a playlist downloads
         every video in full, so there is no time range to show at all.
         """
+        # Anchor after playlist_preview (which replaced info_row)
+        anchor = getattr(self, 'playlist_preview', None) or self.info_row
         if visible:
             if not self.time_range_section.winfo_manager():
-                self.time_range_section.pack(fill="x", after=self.info_row)
+                self.time_range_section.pack(fill="x", after=anchor)
         else:
             if self.time_range_section.winfo_manager():
                 self.time_range_section.pack_forget()
