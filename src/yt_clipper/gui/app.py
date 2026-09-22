@@ -10,12 +10,13 @@ from tkinter import filedialog
 
 from yt_clipper.core import config as app_config
 from yt_clipper.core import js_runtime
-from yt_clipper.core.utils import format_seconds
+from yt_clipper.core.utils import format_seconds, sanitize_filename
 from yt_clipper.gui.controllers import VideoLoaderController, QueueController, UpdateChecker
 from yt_clipper.gui.controllers.update_checker import CURRENT_VERSION
 from yt_clipper.gui.controllers.video_loader import THUMBNAIL_SIZE
 from yt_clipper.gui.services import SequentialDownloadQueue
 from yt_clipper.gui.widgets.time_input import TimeInput
+from yt_clipper.gui.widgets.playlist_preview import PlaylistPreviewWidget
 
 
 ctk.set_appearance_mode("dark")
@@ -131,6 +132,7 @@ class ClipperApp(ctk.CTk):
         )
         url_row = ctk.CTkFrame(card, fg_color="transparent")
         url_row.pack(fill="x", padx=20)
+        self.url_row = url_row
         self.url_entry = ctk.CTkEntry(
             url_row,
             placeholder_text="https://youtube.com/watch?v=...",
@@ -146,6 +148,7 @@ class ClipperApp(ctk.CTk):
         )
         self.load_btn.pack(side="left")
 
+        # Single-video preview (original widget, now retained for video URLs)
         self.info_row = ctk.CTkFrame(card, fg_color="transparent")
         self.info_row.pack(fill="x", padx=20, pady=(8, 8))
         self.thumbnail_label = ctk.CTkLabel(
@@ -167,6 +170,13 @@ class ClipperApp(ctk.CTk):
         )
         self.video_info_label.pack(side="left", fill="x", expand=True)
 
+        # Playlist preview widget (for playlist URLs)
+        # Placed in same general location as info_row, but hidden initially
+        # Only one preview is visible at a time
+        self.playlist_preview = PlaylistPreviewWidget(card)
+        # Do NOT pack playlist_preview initially; show single preview by default
+        # It will be packed when a playlist URL is loaded
+
         self.load_progress = ctk.CTkProgressBar(
             card,
             height=5,
@@ -177,6 +187,7 @@ class ClipperApp(ctk.CTk):
         # can be hidden as a unit for playlist downloads (which use no time
         # range - every video downloads in full) and shown again for a
         # single video, without touching each widget's own layout below.
+        # Initially after info_row (single preview visible by default)
         self.time_range_section = ctk.CTkFrame(card, fg_color="transparent")
         self.time_range_section.pack(fill="x", after=self.info_row)
 
@@ -276,6 +287,7 @@ class ClipperApp(ctk.CTk):
             command=self.queue_controller.download_clip,
             fg_color="#2e7d32",
             hover_color="#1b5e20",
+            state="disabled",
         )
         self.download_button.pack(fill="x")
 
@@ -424,15 +436,101 @@ class ClipperApp(ctk.CTk):
     def set_status(self, text, color="gray"):
         self.status_label.configure(text=text, text_color=color)
 
+    def _get_current_preview_anchor(self):
+        """Return the currently visible preview widget for anchoring time_range."""
+        # Prefer whichever preview is currently managed (visible)
+        if hasattr(self, 'playlist_preview') and self.playlist_preview.winfo_manager():
+            return self.playlist_preview
+        return self.info_row
+
+    def _has_valid_download_data(self) -> bool:
+        """Check if there is at least one valid video that can be downloaded.
+
+        Uses shared application state that is also used by preview and queue:
+        - Single video: video_duration and loaded_url present, no playlist entries
+        - Playlist: loaded_playlist_entries non-empty (already filtered for availability)
+        """
+        # Playlist case: filtered available entries
+        if self.loaded_playlist_entries is not None:
+            try:
+                return len(self.loaded_playlist_entries) > 0
+            except Exception:
+                return False
+        # Single video case
+        if self.loaded_url and self.video_duration is not None:
+            try:
+                # Ensure duration is usable
+                import math
+                if isinstance(self.video_duration, (int, float)) and not isinstance(self.video_duration, bool):
+                    if math.isfinite(self.video_duration) and self.video_duration > 0:
+                        return True
+            except Exception:
+                return False
+        return False
+
+    def update_download_button_state(self):
+        """Enable/disable download button based on validated data."""
+        try:
+            can_download = self._has_valid_download_data()
+            self.download_button.configure(state="normal" if can_download else "disabled")
+        except Exception:
+            # Never crash UI due to button state update
+            try:
+                self.download_button.configure(state="disabled")
+            except Exception:
+                pass
+
+    def set_download_enabled(self, enabled: bool):
+        """Explicitly set download button enabled/disabled."""
+        try:
+            self.download_button.configure(state="normal" if enabled else "disabled")
+        except Exception:
+            pass
+
+    def show_single_preview(self):
+        """Show single-video preview, hide playlist preview."""
+        # Hide playlist preview if visible
+        if hasattr(self, 'playlist_preview') and self.playlist_preview.winfo_manager():
+            self.playlist_preview.pack_forget()
+        # Show single preview if not visible - keep it in original place after url_row
+        if not self.info_row.winfo_manager():
+            # Put back in its original place: after url_row, before time_range_section
+            try:
+                self.info_row.pack(fill="x", padx=20, pady=(8, 8), after=self.url_row)
+            except Exception:
+                # Fallback if after fails (e.g., url_row not managed)
+                self.info_row.pack(fill="x", padx=20, pady=(8, 8))
+        # Re-anchor time_range after current preview
+        if self.time_range_section.winfo_manager():
+            self.time_range_section.pack_forget()
+            self.time_range_section.pack(fill="x", after=self._get_current_preview_anchor())
+
+    def show_playlist_preview(self):
+        """Show playlist preview, hide single-video preview."""
+        # Hide single preview if visible
+        if self.info_row.winfo_manager():
+            self.info_row.pack_forget()
+        # Show playlist preview if not visible - same place as single preview was
+        if not self.playlist_preview.winfo_manager():
+            try:
+                self.playlist_preview.pack(fill="x", padx=20, pady=(8, 8), after=self.url_row)
+            except Exception:
+                self.playlist_preview.pack(fill="x", padx=20, pady=(8, 8))
+        # Re-anchor time_range after current preview
+        if self.time_range_section.winfo_manager():
+            self.time_range_section.pack_forget()
+            self.time_range_section.pack(fill="x", after=self._get_current_preview_anchor())
+
     def set_time_range_visible(self, visible):
         """Show or hide the Start/End Time block as a single unit.
 
         Used for single-video vs playlist detection: a playlist downloads
         every video in full, so there is no time range to show at all.
         """
+        anchor = self._get_current_preview_anchor()
         if visible:
             if not self.time_range_section.winfo_manager():
-                self.time_range_section.pack(fill="x", after=self.info_row)
+                self.time_range_section.pack(fill="x", after=anchor)
         else:
             if self.time_range_section.winfo_manager():
                 self.time_range_section.pack_forget()
@@ -474,11 +572,32 @@ class ClipperApp(ctk.CTk):
         if not isinstance(initial_dir, str) or not Path(initial_dir).is_dir():
             initial_dir = str(Path.home())
 
-        path = filedialog.asksaveasfilename(
-            defaultextension=extension,
-            filetypes=filetypes,
-            initialdir=initial_dir,
-        )
+        # Use existing video title (source of truth: self.loaded_title) as default
+        # filename in the save dialog, passing through existing sanitization pipeline.
+        initial_file = None
+        try:
+            raw_title = (self.loaded_title or "").strip()
+            if raw_title:
+                safe_stem = sanitize_filename(raw_title)
+                # Guard against empty / "None" / "undefined" after sanitization
+                if safe_stem and safe_stem.lower() not in ("none", "undefined"):
+                    initial_file = f"{safe_stem}{extension}"
+        except Exception:
+            initial_file = None
+
+        if initial_file:
+            path = filedialog.asksaveasfilename(
+                defaultextension=extension,
+                filetypes=filetypes,
+                initialdir=initial_dir,
+                initialfile=initial_file,
+            )
+        else:
+            path = filedialog.asksaveasfilename(
+                defaultextension=extension,
+                filetypes=filetypes,
+                initialdir=initial_dir,
+            )
         if not path:
             return
 

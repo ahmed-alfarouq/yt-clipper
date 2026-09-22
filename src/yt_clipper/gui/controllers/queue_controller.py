@@ -9,6 +9,10 @@ from tkinter import messagebox
 
 from yt_clipper.core import config as app_config
 from yt_clipper.core.utils import format_seconds, sanitize_filename
+try:
+    from yt_clipper.core.playlist_utils import filter_available_videos
+except ImportError:
+    from yt_clipper.core.utils import filter_available_videos
 from yt_clipper.gui.models import DownloadJob
 
 STATUS_COLORS = {
@@ -26,15 +30,17 @@ STATUS_COLORS = {
 
 class QueueController:
     """Owns the download queue: enqueueing jobs, rendering rows, and
-    reacting to job lifecycle events posted by the background worker."""
+    reacting to job lifecycle events posted by the background worker.
+
+    Playlist handling:
+      - Receives VALIDATED playlist entries from shared state (already filtered)
+      - Defensive check with filter_available_videos() as safety net
+      - Preview and Download share same validated dataset
+    """
 
     def __init__(self, app):
         self.app = app
-        # Tracks the most recent successful output path so the "open folder"
-        # action can fire once per finished batch, not once per clip.
         self.last_output_path = None
-
-    # ---------- Enqueueing ----------
 
     def download_clip(self):
         app = self.app
@@ -58,11 +64,13 @@ class QueueController:
             )
             return
 
-        # Playlists ignore start/end entirely - every video downloads in
-        # full - so this branch is handled before any time-range reading
-        # or validation happens below.
         if app.loaded_url == url and app.loaded_playlist_entries:
-            self._enqueue_playlist(app.loaded_playlist_entries, audio_only, requested_path)
+            # Shared validated dataset – already filtered, but defensive check
+            try:
+                validated = filter_available_videos(app.loaded_playlist_entries)
+            except Exception:
+                validated = app.loaded_playlist_entries
+            self._enqueue_playlist(validated, audio_only, requested_path)
             self.reset_fields()
             return
 
@@ -83,8 +91,6 @@ class QueueController:
                 return
             label = app.loaded_title or url
         else:
-            # A manually entered URL remains supported, but metadata from a
-            # previously loaded URL is never reused for it.
             label = url
 
         output_path = self._unique_output_path(requested_path)
@@ -122,16 +128,21 @@ class QueueController:
     def _enqueue_playlist(self, entries, audio_only, requested_path):
         """Queue one job per playlist video, each downloaded in full.
 
-        Filenames are numbered ("01 - <title>.<ext>") in the requested
-        output folder, since a single filename can't serve every video and
-        titles alone can collide or contain characters unsafe for a path.
+        Entries are VALIDATED (already filtered for availability) from shared state.
+        Defensive filter as safety net against future code accidentally passing raw entries.
         """
         app = self.app
         directory = requested_path.parent
         extension = requested_path.suffix or (".mp3" if audio_only else ".mp4")
 
+        # Defensive check – primary filtering already happened earlier
+        try:
+            validated_entries = filter_available_videos(entries)
+        except Exception:
+            validated_entries = entries
+
         queued_count = 0
-        for index, entry in enumerate(entries, start=1):
+        for index, entry in enumerate(validated_entries, start=1):
             safe_title = sanitize_filename(entry.get("title") or f"video_{index}")
             candidate = directory / f"{index:02d} - {safe_title}{extension}"
             output_path = self._unique_output_path(candidate)
@@ -148,8 +159,6 @@ class QueueController:
             )
             app.queue_jobs.append(job)
             queued_behind_another = app.download_queue.enqueue(job)
-            # Every entry after the first is necessarily behind at least the
-            # one before it, even if the queue was otherwise idle.
             job.status = "Waiting" if (queued_behind_another or index > 1) else "Queued"
             queued_count += 1
 
@@ -175,8 +184,6 @@ class QueueController:
     @staticmethod
     def _normalized_path_key(path):
         return os.path.normcase(os.path.abspath(os.fspath(path)))
-
-    # ---------- Rendering ----------
 
     def render_queue(self):
         app = self.app
@@ -253,8 +260,6 @@ class QueueController:
     def _find_job(self, job_id):
         return next((job for job in self.app.queue_jobs if job.id == job_id), None)
 
-    # ---------- Job lifecycle events (called from app._handle_ui_event) ----------
-
     def _apply_job_started(self, job_id):
         app = self.app
         job = self._find_job(job_id)
@@ -278,10 +283,10 @@ class QueueController:
         self.render_queue()
 
     def _apply_download_progress(self, job_id, data):
+        if self._find_job(job_id) is None:
+            return
         status = data.get("status")
         if status == "downloading":
-            # A prior "retrying" event may have left job.status stuck there;
-            # a normal progress event means the attempt is actually running.
             job = self._find_job(job_id)
             if job is not None and job.status != "Downloading":
                 job.status = "Downloading"
@@ -394,11 +399,7 @@ class QueueController:
         job.progress = 1.0
         app._active_job_id = None
         app.progress.set(1)
-
-        # Folder-opening is deferred to _queue_idle so a multi-clip batch
-        # opens Explorer once, not once per finished clip.
         self.last_output_path = job.output_path
-
         app.set_status(f"✅ Saved to {job.output_path}", "#4caf50")
         self.render_queue()
 
@@ -418,14 +419,30 @@ class QueueController:
         job = self._find_job(job_id)
         if job is None:
             return
-        job.status = "Cancelled"
-        job.error = None
-        job.progress = 0.0
+        output_name = Path(job.output_path).name if getattr(job, "output_path", None) else ""
+        try:
+            if job in app.queue_jobs:
+                app.queue_jobs.remove(job)
+        except ValueError:
+            pass
         if app._active_job_id == job_id:
             app._active_job_id = None
-            app.progress.set(0)
-        app.set_status(f"Cancelled: {Path(job.output_path).name}", "gray")
+            try:
+                app.progress.set(0)
+            except Exception:
+                pass
+        try:
+            app._queue_status_labels.pop(job_id, None)
+        except Exception:
+            pass
         self.render_queue()
+        try:
+            if output_name:
+                app.set_status(f"Cancelled: {output_name} removed", "gray")
+            else:
+                app.set_status("Download cancelled", "gray")
+        except Exception:
+            pass
 
     def _queue_idle(self):
         app = self.app
@@ -434,7 +451,6 @@ class QueueController:
 
         done_count = sum(job.status == "Done" for job in app.queue_jobs)
         error_count = sum(job.status == "Error" for job in app.queue_jobs)
-        cancelled_count = sum(job.status == "Cancelled" for job in app.queue_jobs)
 
         if self.last_output_path and app.open_folder_var.get():
             self._open_containing_folder(self.last_output_path)
@@ -442,21 +458,15 @@ class QueueController:
 
         if error_count:
             app.set_status(
-                f"Downloads finished: {done_count} completed, {error_count} failed, "
-                f"{cancelled_count} cancelled",
+                f"Downloads finished: {done_count} completed, {error_count} failed",
                 "#e6a817",
             )
-        elif cancelled_count:
-            app.set_status(
-                f"Downloads finished: {done_count} completed, "
-                f"{cancelled_count} cancelled",
-                "gray",
-            )
         else:
-            app.progress.set(1)
-            app.set_status(
-                f"Downloads finished: {done_count} completed", "#4caf50"
-            )
+            if done_count:
+                app.progress.set(1)
+                app.set_status(
+                    f"Downloads finished: {done_count} completed", "#4caf50"
+                )
 
     @staticmethod
     def _open_containing_folder(file_path):
@@ -469,28 +479,34 @@ class QueueController:
             else:
                 subprocess.run(["xdg-open", folder], check=False)
         except Exception:
-            # Opening the folder is a convenience feature; failures here
-            # should never interrupt or overshadow a successful download.
             pass
-
-    # ---------- Reset ----------
 
     def reset_fields(self):
         app = self.app
-
-        # Invalidate any in-flight video load/thumbnail fetch for the video
-        # that's being cleared out, so a late-arriving thumbnail event can't
-        # write into state that no longer describes what's on screen.
         app._load_request_id += 1
-
         app.url_entry.delete(0, "end")
         app.loaded_url = None
         app.loaded_title = None
         app.loaded_playlist_entries = None
         app.video_duration = None
         app.video_loader._set_thumbnail(None, False)
-
-        # Restore Start/End Time to visible, in case the field just cleared
-        # belonged to a playlist (which hides them) - the next URL typed in
-        # may well be a single video.
+        try:
+            app.playlist_preview.clear()
+        except Exception:
+            pass
+        try:
+            app.show_single_preview()
+        except Exception:
+            pass
+        try:
+            app.video_info_label.configure(
+                text="No video loaded yet",
+                text_color="gray",
+            )
+        except Exception:
+            pass
+        try:
+            app.set_download_enabled(False)
+        except Exception:
+            pass
         app.set_time_range_visible(True)

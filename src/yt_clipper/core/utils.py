@@ -1,9 +1,16 @@
+"""General utilities: filename sanitization, folder opening, time formatting.
+
+Playlist-specific helpers (availability, sorting, publish-date, URL detection)
+have been moved to playlist_utils.py to keep this file small and focused.
+This file re-exports those helpers for backward compatibility.
+"""
+
 import re
 import os
 import sys
 import subprocess
- 
-_WINDOWS_INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+_WINDOWS_INVALID_CHARS_RE = re.compile(r'[<>:\"/\\|?*\x00-\\x1f]')
 _WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(1, 10)),
@@ -11,26 +18,17 @@ _WINDOWS_RESERVED_NAMES = {
 }
 
 def sanitize_filename(name, fallback="clip", max_length=150):
-    """Turn an arbitrary string (e.g. a video title) into a filename stem
-    that is safe on Windows (and harmless on other platforms).
- 
-    Strips characters Windows forbids in filenames, collapses whitespace,
-    trims trailing dots/spaces (also disallowed by Windows), guards against
-    reserved device names (CON, PRN, COM1, ...), and caps the length.
-    Does not include a file extension; callers append their own.
-    """
+    """Turn an arbitrary string into a filename stem safe on Windows."""
     name = (name or "").strip()
     name = _WINDOWS_INVALID_CHARS_RE.sub("", name)
     name = re.sub(r"\s+", " ", name).strip()
-    name = name.rstrip(" .")  # Windows disallows trailing dots/spaces.
- 
+    name = name.rstrip(" .")
     if not name:
         name = fallback
     if name.upper() in _WINDOWS_RESERVED_NAMES:
         name = f"_{name}"
     if len(name) > max_length:
         name = name[:max_length].rstrip(" .") or fallback
- 
     return name
 
 
@@ -62,3 +60,35 @@ def time_to_seconds(time_str):
         m, s = parts
         return m * 60 + s
     return parts[0]
+
+
+# Re-export playlist utilities for backward compatibility
+from yt_clipper.core.playlist_utils import (
+    parse_publish_date,
+    extract_publish_date,
+    sort_videos_by_publish_date,
+    format_publish_date,
+    is_video_entry_available,
+    is_video_available,
+    filter_available_videos,
+    detect_youtube_url_type,
+    is_youtube_playlist_url,
+    is_youtube_video_url,
+)
+
+__all__ = [
+    "sanitize_filename",
+    "open_containing_folder",
+    "format_seconds",
+    "time_to_seconds",
+    "parse_publish_date",
+    "extract_publish_date",
+    "sort_videos_by_publish_date",
+    "format_publish_date",
+    "is_video_entry_available",
+    "is_video_available",
+    "filter_available_videos",
+    "detect_youtube_url_type",
+    "is_youtube_playlist_url",
+    "is_youtube_video_url",
+]
