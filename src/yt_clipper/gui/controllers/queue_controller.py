@@ -278,6 +278,9 @@ class QueueController:
         self.render_queue()
 
     def _apply_download_progress(self, job_id, data):
+        # Prevent late worker callbacks from updating a removed (cancelled) item
+        if self._find_job(job_id) is None:
+            return
         status = data.get("status")
         if status == "downloading":
             # A prior "retrying" event may have left job.status stuck there;
@@ -417,15 +420,44 @@ class QueueController:
         app = self.app
         job = self._find_job(job_id)
         if job is None:
+            # Already removed (repeated callback or late event) – safe no-op
             return
-        job.status = "Cancelled"
-        job.error = None
-        job.progress = 0.0
+
+        # Preserve name for status before removal
+        output_name = Path(job.output_path).name if getattr(job, "output_path", None) else ""
+
+        # Remove from underlying collection – source of truth for download list
+        try:
+            if job in app.queue_jobs:
+                app.queue_jobs.remove(job)
+        except ValueError:
+            pass
+
+        # Clean up active tracking
         if app._active_job_id == job_id:
             app._active_job_id = None
-            app.progress.set(0)
-        app.set_status(f"Cancelled: {Path(job.output_path).name}", "gray")
+            try:
+                app.progress.set(0)
+            except Exception:
+                pass
+
+        # Clean up per-job UI state to prevent late updates
+        try:
+            app._queue_status_labels.pop(job_id, None)
+        except Exception:
+            pass
+
+        # Re-render from updated state – cancelled item disappears completely
         self.render_queue()
+
+        # Status feedback – not an error
+        try:
+            if output_name:
+                app.set_status(f"Cancelled: {output_name} removed", "gray")
+            else:
+                app.set_status("Download cancelled", "gray")
+        except Exception:
+            pass
 
     def _queue_idle(self):
         app = self.app
@@ -434,7 +466,8 @@ class QueueController:
 
         done_count = sum(job.status == "Done" for job in app.queue_jobs)
         error_count = sum(job.status == "Error" for job in app.queue_jobs)
-        cancelled_count = sum(job.status == "Cancelled" for job in app.queue_jobs)
+        # Cancelled items are now removed completely, so cancelled_count should be 0.
+        # Keep logic for any legacy cancelled that might still be present before migration.
 
         if self.last_output_path and app.open_folder_var.get():
             self._open_containing_folder(self.last_output_path)
@@ -442,21 +475,17 @@ class QueueController:
 
         if error_count:
             app.set_status(
-                f"Downloads finished: {done_count} completed, {error_count} failed, "
-                f"{cancelled_count} cancelled",
+                f"Downloads finished: {done_count} completed, {error_count} failed",
                 "#e6a817",
             )
-        elif cancelled_count:
-            app.set_status(
-                f"Downloads finished: {done_count} completed, "
-                f"{cancelled_count} cancelled",
-                "gray",
-            )
         else:
-            app.progress.set(1)
-            app.set_status(
-                f"Downloads finished: {done_count} completed", "#4caf50"
-            )
+            # Only set completed message if there are completed jobs;
+            # if list is empty after cancellation, render_queue already shows empty state.
+            if done_count:
+                app.progress.set(1)
+                app.set_status(
+                    f"Downloads finished: {done_count} completed", "#4caf50"
+                )
 
     @staticmethod
     def _open_containing_folder(file_path):
