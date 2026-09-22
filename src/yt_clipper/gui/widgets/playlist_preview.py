@@ -12,10 +12,16 @@ try:
 except ImportError:
     Image = None  # type: ignore
 
-from yt_clipper.core.utils import (
-    format_publish_date,
-    sort_videos_by_publish_date,
-)
+try:
+    from yt_clipper.core.playlist_utils import (
+        format_publish_date,
+        sort_videos_by_publish_date,
+    )
+except ImportError:
+    from yt_clipper.core.utils import (
+        format_publish_date,
+        sort_videos_by_publish_date,
+    )
 
 THUMBNAIL_SIZE = (120, 68)
 # Two items visible: each item ~ 84px + padding, so ~ 190px height
