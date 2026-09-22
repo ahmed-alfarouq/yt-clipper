@@ -132,6 +132,7 @@ class ClipperApp(ctk.CTk):
         )
         url_row = ctk.CTkFrame(card, fg_color="transparent")
         url_row.pack(fill="x", padx=20)
+        self.url_row = url_row
         self.url_entry = ctk.CTkEntry(
             url_row,
             placeholder_text="https://youtube.com/watch?v=...",
@@ -446,9 +447,14 @@ class ClipperApp(ctk.CTk):
         # Hide playlist preview if visible
         if hasattr(self, 'playlist_preview') and self.playlist_preview.winfo_manager():
             self.playlist_preview.pack_forget()
-        # Show single preview if not visible
+        # Show single preview if not visible - keep it in original place after url_row
         if not self.info_row.winfo_manager():
-            self.info_row.pack(fill="x", padx=20, pady=(8, 8))
+            # Put back in its original place: after url_row, before time_range_section
+            try:
+                self.info_row.pack(fill="x", padx=20, pady=(8, 8), after=self.url_row)
+            except Exception:
+                # Fallback if after fails (e.g., url_row not managed)
+                self.info_row.pack(fill="x", padx=20, pady=(8, 8))
         # Re-anchor time_range after current preview
         if self.time_range_section.winfo_manager():
             self.time_range_section.pack_forget()
@@ -459,9 +465,12 @@ class ClipperApp(ctk.CTk):
         # Hide single preview if visible
         if self.info_row.winfo_manager():
             self.info_row.pack_forget()
-        # Show playlist preview if not visible
+        # Show playlist preview if not visible - same place as single preview was
         if not self.playlist_preview.winfo_manager():
-            self.playlist_preview.pack(fill="x", padx=20, pady=(8, 8))
+            try:
+                self.playlist_preview.pack(fill="x", padx=20, pady=(8, 8), after=self.url_row)
+            except Exception:
+                self.playlist_preview.pack(fill="x", padx=20, pady=(8, 8))
         # Re-anchor time_range after current preview
         if self.time_range_section.winfo_manager():
             self.time_range_section.pack_forget()
