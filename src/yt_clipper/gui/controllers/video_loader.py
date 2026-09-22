@@ -14,7 +14,13 @@ except ImportError:  # The rest of the application can still run without thumbna
     Image = None
 
 from yt_clipper.core import downloader
-from yt_clipper.core.utils import format_seconds, sanitize_filename
+from yt_clipper.core.utils import (
+    format_seconds,
+    sanitize_filename,
+    sort_videos_by_publish_date,
+    filter_available_videos,
+    detect_youtube_url_type,
+)
 
 THUMBNAIL_SIZE = (120, 68)
 
@@ -37,19 +43,35 @@ class VideoLoaderController:
         app._load_request_id += 1
         request_id = app._load_request_id
         app.load_btn.configure(state="disabled", text="Loading...")
-        # Legacy label (hidden) kept for backward compat
+
+        # Detect URL type for initial preview switching (heuristic before extraction)
+        url_type = detect_youtube_url_type(url)
         try:
-            app.video_info_label.configure(
-                text="Connecting to YouTube...\nReading video details; this may take a few seconds.",
-                text_color="#4da6ff",
-            )
+            if url_type == "playlist":
+                # Show playlist preview loading, hide single preview
+                try:
+                    app.show_playlist_preview()
+                except Exception:
+                    pass
+                app.playlist_preview.show_loading("Connecting to YouTube... Reading playlist details...")
+                app.video_info_label.configure(
+                    text="Connecting to YouTube...\nReading playlist details...",
+                    text_color="#4da6ff",
+                )
+            else:
+                # Default to single preview for video URLs and unknown
+                try:
+                    app.show_single_preview()
+                except Exception:
+                    pass
+                app.video_info_label.configure(
+                    text="Connecting to YouTube...\nReading video details; this may take a few seconds.",
+                    text_color="#4da6ff",
+                )
+                app.playlist_preview.show_loading("Connecting to YouTube... Reading video details...")
         except Exception:
             pass
-        # New playlist preview shows loading state
-        try:
-            app.playlist_preview.show_loading("Connecting to YouTube... Reading video details...")
-        except Exception:
-            pass
+
         app.set_status("Loading video information...", "#4da6ff")
         self._show_load_progress()
 
@@ -71,15 +93,21 @@ class VideoLoaderController:
 
             if result["is_playlist"]:
                 entries = result["entries"]
+                # Filter unavailable before passing to preview (task requirement)
+                # Downloader already filters, but filter again for safety and to handle
+                # any edge cases where raw entries might still contain unavailable
+                try:
+                    available = filter_available_videos(entries)
+                except Exception:
+                    available = entries
+
                 app._post_ui_event(
                     "playlist_metadata",
                     request_id,
                     url,
                     result.get("playlist_title") or "Playlist",
-                    entries,
+                    available,
                 )
-                # Thumbnail fetching is now handled by PlaylistPreviewWidget itself
-                # for each video, with caching. No need to fetch first thumbnail here.
                 return
 
             entry = result["entries"][0]
@@ -95,7 +123,7 @@ class VideoLoaderController:
                 )
 
             title = str(entry.get("title") or "Unknown title")
-            # Pass full entry so publish_date and thumbnail are available for playlist preview
+            # Pass full entry so publish_date and thumbnail are available
             app._post_ui_event(
                 "video_metadata",
                 request_id,
@@ -105,8 +133,6 @@ class VideoLoaderController:
                 entry,
             )
 
-            # Legacy thumbnail fetch kept for backward compat, but playlist_preview
-            # will also fetch its own thumbnail with caching
             thumbnail, thumbnail_failed = self._fetch_thumbnail(entry.get("thumbnail"))
             app._post_ui_event(
                 "video_thumbnail",
@@ -127,9 +153,6 @@ class VideoLoaderController:
                 thumbnail_url,
                 headers={"User-Agent": "YT-Clipper/1.0"},
             )
-            # The per-call timeout below fully bounds this request; no need
-            # to touch the process-global socket timeout (which would be
-            # unsafe to mutate while other threads may be using sockets too).
             with urllib.request.urlopen(request, timeout=6) as response:
                 image_data = response.read()
             image = Image.open(io.BytesIO(image_data)).convert("RGB")
@@ -143,7 +166,10 @@ class VideoLoaderController:
 
     def _show_load_progress(self):
         app = self.app
-        anchor = getattr(app, 'playlist_preview', None) or app.info_row
+        try:
+            anchor = app._get_current_preview_anchor()
+        except Exception:
+            anchor = getattr(app, 'playlist_preview', None) or app.info_row
         if not app.load_progress.winfo_manager():
             app.load_progress.pack(
                 fill="x",
@@ -175,9 +201,15 @@ class VideoLoaderController:
         except Exception:
             pass
         try:
-            app.playlist_preview.show_loading(
-                f"⚠ Network hiccup, retrying ({attempt}/{max_attempts}) in {delay:.0f}s...\n{error_text}"
-            )
+            # Show retry in whichever preview is currently visible
+            if hasattr(app, 'playlist_preview') and app.playlist_preview.winfo_manager():
+                app.playlist_preview.show_loading(
+                    f"⚠ Network hiccup, retrying ({attempt}/{max_attempts}) in {delay:.0f}s...\n{error_text}"
+                )
+            else:
+                app.playlist_preview.show_loading(
+                    f"⚠ Network hiccup, retrying ({attempt}/{max_attempts}) in {delay:.0f}s..."
+                )
         except Exception:
             pass
         app.set_status(f"Retrying video load ({attempt}/{max_attempts})...", "#e6a817")
@@ -187,59 +219,87 @@ class VideoLoaderController:
         if request_id != app._load_request_id:
             return
 
-        app.loaded_url = url
-        app.loaded_title = playlist_title
+        # Filter unavailable videos (task requirement) - before sorting and before widget
+        try:
+            available_entries = filter_available_videos(entries)
+        except Exception:
+            available_entries = list(entries)
+
         # Sort oldest→newest by publish date, missing dates at end
         try:
-            from yt_clipper.core.utils import sort_videos_by_publish_date
-            sorted_entries = sort_videos_by_publish_date(entries)
+            sorted_entries = sort_videos_by_publish_date(available_entries)
         except Exception:
-            sorted_entries = list(entries)
+            sorted_entries = list(available_entries)
 
+        app.loaded_url = url
+        app.loaded_title = playlist_title
         app.loaded_playlist_entries = sorted_entries
-        app.video_duration = None  # no single duration; every video in the
-                                    # playlist is downloaded in full instead
+        app.video_duration = None
 
         self._set_thumbnail(None, False)
-        # Start/End Time have no meaning for a full-playlist download, so
-        # they're hidden entirely rather than disabled - there's nothing
-        # for the user to set here.
         app.set_time_range_visible(False)
-
         self._apply_suggested_filename(playlist_title)
 
-        # Legacy label kept for backward compat (hidden)
+        # Switch to playlist preview, hide single preview
         try:
-            app.video_info_label.configure(
-                text=(
-                    f"📃  {playlist_title}\n"
-                    f"{len(sorted_entries)} videos in playlist\n"
-                    "Each video will be downloaded in full • Sorted oldest→newest"
-                ),
-                text_color="#4caf50",
-            )
+            app.show_playlist_preview()
         except Exception:
             pass
 
-        # New playlist preview widget - displays all videos sorted
+        # Legacy label (now hidden when playlist visible, but keep for compat)
         try:
-            app.playlist_preview.set_videos(sorted_entries)
+            if not sorted_entries:
+                app.video_info_label.configure(
+                    text=(
+                        f"📃  {playlist_title}\n"
+                        f"No available videos in playlist\n"
+                        f"All videos are unavailable/private/deleted"
+                    ),
+                    text_color="#e6a817",
+                )
+            else:
+                app.video_info_label.configure(
+                    text=(
+                        f"📃  {playlist_title}\n"
+                        f"{len(sorted_entries)} available videos (filtered, sorted oldest→newest)\n"
+                        f"Each video will be downloaded in full"
+                    ),
+                    text_color="#4caf50",
+                )
+        except Exception:
+            pass
+
+        # Playlist preview widget - displays filtered & sorted videos
+        try:
+            if not sorted_entries:
+                app.playlist_preview.clear()
+                app.playlist_preview._show_empty_state(
+                    f"📃 {playlist_title}\nNo available videos — all are private/deleted/unavailable"
+                )
+            else:
+                app.playlist_preview.set_videos(sorted_entries)
         except Exception:
             pass
 
         app.load_btn.configure(state="normal", text="Load Video")
         self._hide_load_progress()
-        app.set_status(
-            f"Playlist loaded ({len(sorted_entries)} videos, sorted oldest→newest). Click Download to queue them all.",
-            "#4caf50",
-        )
+        if not sorted_entries:
+            app.set_status(
+                f"Playlist loaded but no available videos (all unavailable)",
+                "#e6a817",
+            )
+        else:
+            app.set_status(
+                f"Playlist loaded ({len(sorted_entries)} available, sorted oldest→newest). Click Download to queue them all.",
+                "#4caf50",
+            )
 
     def _apply_playlist_thumbnail(self, request_id, thumbnail, thumbnail_failed):
         app = self.app
         if request_id != app._load_request_id:
             return
 
-        # Legacy thumbnail handling (hidden widget)
+        # Legacy thumbnail handling (now hidden when playlist preview visible)
         self._set_thumbnail(thumbnail, thumbnail_failed)
         entries = app.loaded_playlist_entries or []
         thumbnail_note = (
@@ -257,9 +317,7 @@ class VideoLoaderController:
             )
         except Exception:
             pass
-        # New UI: playlist_preview already handles its own thumbnails per-video,
-        # so we don't need to update it here. The first thumbnail event is now
-        # essentially a no-op for the new preview.
+        # New UI: playlist_preview handles its own thumbnails per-video
 
     def _apply_video_metadata(self, request_id, url, title, duration, entry=None):
         app = self.app
@@ -270,8 +328,6 @@ class VideoLoaderController:
         app.loaded_url = url
         app.loaded_title = title
         app.loaded_playlist_entries = None
-        # A single video always uses a time range, even if the previous
-        # load was a playlist that hid these fields.
         app.set_time_range_visible(True)
         self._apply_suggested_filename(title)
 
@@ -281,6 +337,13 @@ class VideoLoaderController:
         app.end_slider.set(duration)
         app.start_input.set_seconds(0)
         app.end_input.set_seconds(duration)
+
+        # Switch to single-video preview, hide playlist preview
+        try:
+            app.show_single_preview()
+        except Exception:
+            pass
+
         try:
             app.video_info_label.configure(
                 text=(
@@ -294,29 +357,12 @@ class VideoLoaderController:
             pass
         app.update_clip_length()
 
-        # New playlist preview: show single video as a one-item playlist
-        # This replaces the old single-video preview per task requirements
+        # Clear playlist preview to avoid stale data when switching from playlist→video
         try:
-            if entry is None:
-                entry = {
-                    "url": url,
-                    "title": title,
-                    "duration": duration,
-                    "thumbnail": None,
-                    "publish_date": None,
-                }
-            # Ensure entry has at least url and title
-            if not entry.get("url"):
-                entry["url"] = url
-            if not entry.get("title"):
-                entry["title"] = title
-            app.playlist_preview.set_videos([entry])
+            app.playlist_preview.clear()
         except Exception:
             pass
 
-        # Unlock the UI as soon as we have what's actually needed
-        # (duration/URL). The thumbnail is a nice-to-have and must never be
-        # able to block the user from downloading.
         app.load_btn.configure(state="normal", text="Load Video")
         self._hide_load_progress()
         app.set_status("Video loaded. Fetching thumbnail...", "#4da6ff")
@@ -353,20 +399,7 @@ class VideoLoaderController:
             )
         except Exception:
             pass
-        # New UI: playlist_preview already shows the video; its thumbnail
-        # fetching is handled internally. We keep legacy thumbnail label update
-        # for backward compat but don't need to refresh playlist_preview here
-        # because it already has the thumbnail URL and will fetch it itself.
-        # However, if the legacy fetch succeeded, we can try to update cache.
-        try:
-            if thumbnail is not None and app.loaded_url:
-                # The widget's cache is keyed by thumbnail URL, not by image,
-                # so we can't directly inject the PIL image here. The widget
-                # will fetch its own thumbnail. This is intentional to avoid
-                # coupling.
-                pass
-        except Exception:
-            pass
+
         app.load_btn.configure(state="normal", text="Load Video")
         self._hide_load_progress()
         app.set_status("Video loaded. Choose a time range and add it to the queue.", "#4caf50")
@@ -382,9 +415,14 @@ class VideoLoaderController:
         app.loaded_playlist_entries = None
         self._set_thumbnail(None, False)
         self._hide_load_progress()
-        # A failed load might follow a previously loaded playlist that hid
-        # these fields - restore them so the UI isn't left looking broken.
         app.set_time_range_visible(True)
+
+        # Show error in single preview (default) and clear playlist preview
+        try:
+            app.show_single_preview()
+        except Exception:
+            pass
+
         try:
             app.video_info_label.configure(
                 text=f"❌ Couldn't load video: {error_message}",
@@ -394,9 +432,9 @@ class VideoLoaderController:
             pass
         try:
             app.playlist_preview.clear()
-            app.playlist_preview._show_empty_state(f"❌ Couldn't load video: {error_message}")
         except Exception:
             pass
+
         app.load_btn.configure(state="normal", text="Load Video")
         app.set_status("Video information could not be loaded.", "#e05252")
 
@@ -429,8 +467,4 @@ class VideoLoaderController:
             app.thumbnail_label.configure(image=ctk_image, text="")
             app._thumbnail_image = ctk_image
         except Exception:
-            # The thumbnail is a nice-to-have. A Tk/CTk quirk here must never
-            # abort the caller mid-way through applying video/playlist
-            # metadata - that would leave the Load button and progress bar
-            # stuck forever, which is worse than a missing thumbnail.
             app._thumbnail_image = None

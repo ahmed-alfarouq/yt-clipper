@@ -242,3 +242,205 @@ def format_publish_date(value: Any) -> str:
         return dt.strftime("%B %d, %Y")
     except Exception:
         return "Unknown date"
+
+
+# ---------------------------------------------------------------------------
+# Availability filtering & URL type detection (for dual preview modes)
+# ---------------------------------------------------------------------------
+
+_UNAVAILABLE_TITLE_MARKERS = (
+    "[private video]",
+    "[deleted video]",
+    "[unavailable]",
+    "private video",
+    "deleted video",
+    "unavailable video",
+)
+
+_UNAVAILABLE_AVAILABILITY = {
+    "private",
+    "needs_auth",
+    "premium",
+    "subscriber_only",
+    "unavailable",
+    "needs_premium",
+    "needs_subscription",
+    "requires_auth",
+    "auth_required",
+    "removed",
+    "deleted",
+}
+
+
+def is_video_entry_available(video: Dict[str, Any]) -> bool:
+    """Return True if a playlist video entry is considered available/playable.
+
+    Uses existing YouTube metadata where possible, without extra network requests.
+
+    Unavailable signals:
+    - None / empty dict
+    - missing http URL
+    - title indicating private/deleted/unavailable
+    - availability field indicating private/needs_auth/premium/etc.
+    - explicit flags like `was_live`? No, live is considered available.
+    - yt-dlp sometimes marks unavailable with `availability` or special titles.
+
+    This function is deliberately conservative: unlisted videos are considered
+    available (they are playable), only clearly private/deleted/removed are filtered.
+    """
+    if not video or not isinstance(video, dict):
+        return False
+
+    url = video.get("url") or video.get("webpage_url") or ""
+    if not isinstance(url, str) or not url.startswith("http"):
+        # Some extractors may still have id but no url for unavailable
+        # If title also indicates unavailable, treat as unavailable
+        # Otherwise require http url
+        return False
+
+    title = (video.get("title") or "").strip()
+    lower_title = title.lower()
+
+    # Exact matches and prefix checks for common unavailable placeholders
+    if lower_title in _UNAVAILABLE_TITLE_MARKERS:
+        return False
+    # Titles like "[Private video] - ..." or starting with marker
+    for marker in _UNAVAILABLE_TITLE_MARKERS:
+        if lower_title.startswith(marker):
+            return False
+    # Contains markers like "[Private video]" anywhere
+    if "[private video]" in lower_title or "[deleted video]" in lower_title:
+        return False
+    if "video unavailable" in lower_title or "video has been removed" in lower_title:
+        return False
+
+    availability = (video.get("availability") or "").strip().lower()
+    if availability in _UNAVAILABLE_AVAILABILITY:
+        return False
+
+    # Some extractors set `availability` to empty but have `playable` flags
+    # yt-dlp can also set `live_status` etc., but we don't filter those
+
+    # Additional heuristic: if both duration and thumbnails missing and title is generic
+    # placeholder, likely unavailable - but we already covered title checks
+
+    return True
+
+
+def filter_available_videos(videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return new list containing only available videos.
+
+    Does NOT mutate original list. Never crashes on malformed entries.
+    If every video is unavailable, returns empty list (caller shows empty state).
+    """
+    if not videos:
+        return []
+    available: List[Dict[str, Any]] = []
+    for v in videos:
+        try:
+            if is_video_entry_available(v):
+                available.append(v)
+        except Exception:
+            # On any unexpected error, skip that entry rather than failing whole playlist
+            continue
+    return available
+
+
+# URL type detection
+
+from urllib.parse import urlparse, parse_qs
+
+
+def detect_youtube_url_type(url: str) -> str:
+    """Detect whether a YouTube URL is a video or playlist.
+
+    Returns:
+        "playlist" - YouTube playlist URL
+        "video"    - YouTube video URL (including video URL that contains list= param)
+        "unknown"  - not a recognizable YouTube URL or empty
+
+    Logic:
+    - Uses urllib parsing, not just substring search.
+    - Handles normal cases:
+        https://www.youtube.com/playlist?list=PLAYLIST_ID → playlist
+        https://www.youtube.com/watch?v=VIDEO_ID → video
+        https://youtu.be/VIDEO_ID → video
+        https://www.youtube.com/shorts/VIDEO_ID → video
+        https://www.youtube.com/embed/VIDEO_ID → video
+    - Important edge: https://www.youtube.com/watch?v=ID&list=PL... → video
+      (video URL containing playlist param should NOT be classified as playlist)
+
+    This mirrors project's existing behavior where expand_playlist's is_playlist
+    flag is the source of truth after extraction, but this heuristic is used for
+    UI preview switching before extraction completes.
+    """
+    if not url or not isinstance(url, str):
+        return "unknown"
+    u = url.strip()
+    if not u:
+        return "unknown"
+
+    try:
+        parsed = urlparse(u)
+        netloc = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        query = parse_qs(parsed.query)
+
+        # Only handle youtube domains; otherwise unknown (caller will default to video)
+        is_youtube = "youtube.com" in netloc or "youtu.be" in netloc
+        if not is_youtube:
+            # Could still be youtube URL without www, check
+            if "youtube" not in netloc and "youtu.be" not in netloc:
+                return "unknown"
+
+        # youtu.be is always video
+        if "youtu.be" in netloc:
+            return "video"
+
+        # Path checks
+        if "/playlist" in path:
+            # https://www.youtube.com/playlist?list=...
+            # Even if it also has v param, playlist path takes precedence
+            return "playlist"
+
+        if "/shorts/" in path or "/embed/" in path or "/watch" in path:
+            # Video URL, even if it contains list= param (video in playlist context)
+            return "video"
+
+        # Query param checks
+        # If list param present and no v param, likely playlist
+        has_list = "list" in query and any(v for v in query.get("list", []) if v)
+        has_v = "v" in query and any(v for v in query.get("v", []) if v)
+
+        if has_list and not has_v:
+            # e.g., ?list=PL... without v
+            return "playlist"
+
+        if has_v:
+            # Any URL with v param is video, even if list also present
+            return "video"
+
+        # Fallback: if only list param present in raw string and path is root or empty
+        if has_list:
+            return "playlist"
+
+        # If URL contains watch?v= pattern but urlparse missed (e.g., no netloc)
+        if "watch?v=" in u.lower() or "youtube.com/watch" in u.lower():
+            return "video"
+
+        # Default to video for youtube.com URLs that look like video
+        # (e.g., youtube.com/v/ID)
+        return "video"
+
+    except Exception:
+        return "unknown"
+
+
+def is_youtube_playlist_url(url: str) -> bool:
+    """Convenience wrapper: True if URL is detected as playlist."""
+    return detect_youtube_url_type(url) == "playlist"
+
+
+def is_youtube_video_url(url: str) -> bool:
+    """Convenience wrapper: True if URL is detected as video."""
+    return detect_youtube_url_type(url) == "video"

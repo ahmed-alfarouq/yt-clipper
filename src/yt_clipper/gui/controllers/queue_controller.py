@@ -489,9 +489,21 @@ class QueueController:
         app.loaded_playlist_entries = None
         app.video_duration = None
         app.video_loader._set_thumbnail(None, False)
-        # Clear new playlist preview widget as well
+        # Clear both previews and restore default empty state
+        # Default is single-video preview visible, playlist hidden
         try:
             app.playlist_preview.clear()
+        except Exception:
+            pass
+        try:
+            app.show_single_preview()
+        except Exception:
+            pass
+        try:
+            app.video_info_label.configure(
+                text="No video loaded yet",
+                text_color="gray",
+            )
         except Exception:
             pass
 

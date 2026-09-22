@@ -174,7 +174,7 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
         raise ValueError(f"Could not fetch info for: {url}")
 
     if info.get("_type") == "playlist" or "entries" in info:
-        entries = []
+        raw_entries = []
         for raw_entry in info.get("entries") or []:
             if not raw_entry:
                 continue
@@ -184,7 +184,7 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
             if not str(entry_url).startswith("http"):
                 entry_url = f"https://www.youtube.com/watch?v={entry_url}"
             publish_date = _extract_publish_date_from_info(raw_entry)
-            entries.append({
+            raw_entries.append({
                 "url": entry_url,
                 "title": raw_entry.get("title") or entry_url,
                 "duration": raw_entry.get("duration"),
@@ -193,9 +193,22 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
                 "upload_date": raw_entry.get("upload_date"),
                 "timestamp": raw_entry.get("timestamp"),
                 "release_timestamp": raw_entry.get("release_timestamp"),
+                "availability": raw_entry.get("availability"),
             })
-        if not entries:
+        if not raw_entries:
             raise ValueError("This playlist has no videos, or they're all unavailable.")
+
+        # Filter unavailable videos before returning (task requirement)
+        # Do not let one unavailable cause entire playlist to fail
+        try:
+            from yt_clipper.core.utils import filter_available_videos
+            entries = filter_available_videos(raw_entries)
+        except Exception:
+            entries = raw_entries
+
+        # If every video is unavailable, return empty list so UI shows empty-state
+        # rather than raising. The original empty check above already handled truly empty playlists.
+        # For all-unavailable case, we return empty entries but still is_playlist True.
         return {
             "is_playlist": True,
             "playlist_title": info.get("title"),

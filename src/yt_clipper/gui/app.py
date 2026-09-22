@@ -147,10 +147,9 @@ class ClipperApp(ctk.CTk):
         )
         self.load_btn.pack(side="left")
 
-        # Legacy single-video preview (kept for backward compat but hidden,
-        # replaced by playlist_preview per task requirements)
+        # Single-video preview (original widget, now retained for video URLs)
         self.info_row = ctk.CTkFrame(card, fg_color="transparent")
-        # Do NOT pack info_row initially; it is replaced by playlist_preview
+        self.info_row.pack(fill="x", padx=20, pady=(8, 8))
         self.thumbnail_label = ctk.CTkLabel(
             self.info_row,
             text="",
@@ -170,10 +169,12 @@ class ClipperApp(ctk.CTk):
         )
         self.video_info_label.pack(side="left", fill="x", expand=True)
 
-        # New playlist preview widget - replaces single-video preview
-        # Placed in same general location where info_row used to be
+        # Playlist preview widget (for playlist URLs)
+        # Placed in same general location as info_row, but hidden initially
+        # Only one preview is visible at a time
         self.playlist_preview = PlaylistPreviewWidget(card)
-        self.playlist_preview.pack(fill="x", padx=20, pady=(8, 8))
+        # Do NOT pack playlist_preview initially; show single preview by default
+        # It will be packed when a playlist URL is loaded
 
         self.load_progress = ctk.CTkProgressBar(
             card,
@@ -185,8 +186,9 @@ class ClipperApp(ctk.CTk):
         # can be hidden as a unit for playlist downloads (which use no time
         # range - every video downloads in full) and shown again for a
         # single video, without touching each widget's own layout below.
+        # Initially after info_row (single preview visible by default)
         self.time_range_section = ctk.CTkFrame(card, fg_color="transparent")
-        self.time_range_section.pack(fill="x", after=self.playlist_preview)
+        self.time_range_section.pack(fill="x", after=self.info_row)
 
         # Start time.
         ctk.CTkLabel(self.time_range_section, text="Start Time", anchor="w").pack(
@@ -432,14 +434,46 @@ class ClipperApp(ctk.CTk):
     def set_status(self, text, color="gray"):
         self.status_label.configure(text=text, text_color=color)
 
+    def _get_current_preview_anchor(self):
+        """Return the currently visible preview widget for anchoring time_range."""
+        # Prefer whichever preview is currently managed (visible)
+        if hasattr(self, 'playlist_preview') and self.playlist_preview.winfo_manager():
+            return self.playlist_preview
+        return self.info_row
+
+    def show_single_preview(self):
+        """Show single-video preview, hide playlist preview."""
+        # Hide playlist preview if visible
+        if hasattr(self, 'playlist_preview') and self.playlist_preview.winfo_manager():
+            self.playlist_preview.pack_forget()
+        # Show single preview if not visible
+        if not self.info_row.winfo_manager():
+            self.info_row.pack(fill="x", padx=20, pady=(8, 8))
+        # Re-anchor time_range after current preview
+        if self.time_range_section.winfo_manager():
+            self.time_range_section.pack_forget()
+            self.time_range_section.pack(fill="x", after=self._get_current_preview_anchor())
+
+    def show_playlist_preview(self):
+        """Show playlist preview, hide single-video preview."""
+        # Hide single preview if visible
+        if self.info_row.winfo_manager():
+            self.info_row.pack_forget()
+        # Show playlist preview if not visible
+        if not self.playlist_preview.winfo_manager():
+            self.playlist_preview.pack(fill="x", padx=20, pady=(8, 8))
+        # Re-anchor time_range after current preview
+        if self.time_range_section.winfo_manager():
+            self.time_range_section.pack_forget()
+            self.time_range_section.pack(fill="x", after=self._get_current_preview_anchor())
+
     def set_time_range_visible(self, visible):
         """Show or hide the Start/End Time block as a single unit.
 
         Used for single-video vs playlist detection: a playlist downloads
         every video in full, so there is no time range to show at all.
         """
-        # Anchor after playlist_preview (which replaced info_row)
-        anchor = getattr(self, 'playlist_preview', None) or self.info_row
+        anchor = self._get_current_preview_anchor()
         if visible:
             if not self.time_range_section.winfo_manager():
                 self.time_range_section.pack(fill="x", after=anchor)
