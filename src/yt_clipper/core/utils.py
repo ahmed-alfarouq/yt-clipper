@@ -248,6 +248,21 @@ def format_publish_date(value: Any) -> str:
 # Availability filtering & URL type detection (for dual preview modes)
 # ---------------------------------------------------------------------------
 
+# yt-dlp flat playlist entries (extract_flat: in_playlist) come from
+# YoutubeTabIE._extract_video / _extract_lockup_view_model:
+#   - id: videoId
+#   - url: https://www.youtube.com/watch?v=ID
+#   - title: may be "[Private video]" / "[Deleted video]" for unavailable
+#   - availability: "public", "unlisted", "private", "needs_auth", etc.
+#     derived from badges AVAILABILITY_PRIVATE/PREMIUM/SUBSCRIPTION
+#   - thumbnails, duration, timestamp may be missing in flat mode
+#
+# Unavailable videos are signaled explicitly by yt-dlp via:
+#   - availability field (private, needs_auth, premium, subscriber_only, unavailable...)
+#   - title placeholders like "[Private video]", "[Deleted video]"
+# We must NOT use weak checks like title presence, thumbnail presence, id presence
+# or publish date presence alone as availability test.
+
 _UNAVAILABLE_TITLE_MARKERS = (
     "[private video]",
     "[deleted video]",
@@ -273,65 +288,72 @@ _UNAVAILABLE_AVAILABILITY = {
 
 
 def is_video_entry_available(video: Dict[str, Any]) -> bool:
-    """Return True if a playlist video entry is considered available/playable.
+    """Determine if a yt-dlp flat playlist entry is usable by download pipeline.
 
-    Uses existing YouTube metadata where possible, without extra network requests.
+    Uses metadata already obtained by playlist extraction, no extra network.
 
-    Unavailable signals:
-    - None / empty dict
-    - missing http URL
-    - title indicating private/deleted/unavailable
-    - availability field indicating private/needs_auth/premium/etc.
-    - explicit flags like `was_live`? No, live is considered available.
-    - yt-dlp sometimes marks unavailable with `availability` or special titles.
+    Available even if:
+      - publish_date is None (sorted to end)
+      - thumbnail is None (fallback used)
+      - title is missing/empty (fallback elsewhere, but still downloadable)
+      - duration is missing (flat entries don't have duration)
 
-    This function is deliberately conservative: unlisted videos are considered
-    available (they are playable), only clearly private/deleted/removed are filtered.
+    Unavailable when yt-dlp explicitly indicates inaccessibility:
+      - availability in _UNAVAILABLE_AVAILABILITY
+      - title is "[Private video]", "[Deleted video]", "[Unavailable]" etc.
+      - url missing or not http (cannot construct valid download)
+      - entry is None/empty
+
+    This is the single source of truth for availability; preview and download
+    must share its filtered result.
     """
     if not video or not isinstance(video, dict):
         return False
 
+    # URL is required for download pipeline to resolve formats.
+    # This is not a weak check: without http url, yt-dlp cannot download.
     url = video.get("url") or video.get("webpage_url") or ""
     if not isinstance(url, str) or not url.startswith("http"):
-        # Some extractors may still have id but no url for unavailable
-        # If title also indicates unavailable, treat as unavailable
-        # Otherwise require http url
         return False
 
+    # Explicit availability signal from yt-dlp badges
+    availability = (video.get("availability") or "").strip().lower()
+    if availability in _UNAVAILABLE_AVAILABILITY:
+        return False
+
+    # Title placeholders yt-dlp uses for hidden/deleted/private
     title = (video.get("title") or "").strip()
     lower_title = title.lower()
 
-    # Exact matches and prefix checks for common unavailable placeholders
     if lower_title in _UNAVAILABLE_TITLE_MARKERS:
         return False
-    # Titles like "[Private video] - ..." or starting with marker
     for marker in _UNAVAILABLE_TITLE_MARKERS:
         if lower_title.startswith(marker):
             return False
-    # Contains markers like "[Private video]" anywhere
     if "[private video]" in lower_title or "[deleted video]" in lower_title:
         return False
     if "video unavailable" in lower_title or "video has been removed" in lower_title:
         return False
 
-    availability = (video.get("availability") or "").strip().lower()
-    if availability in _UNAVAILABLE_AVAILABILITY:
-        return False
-
-    # Some extractors set `availability` to empty but have `playable` flags
-    # yt-dlp can also set `live_status` etc., but we don't filter those
-
-    # Additional heuristic: if both duration and thumbnails missing and title is generic
-    # placeholder, likely unavailable - but we already covered title checks
-
+    # Otherwise, consider available – even if title empty, thumbnail None,
+    # publish_date None, duration None – those are handled elsewhere.
     return True
+
+
+def is_video_available(video: Dict[str, Any]) -> bool:
+    """Alias for is_video_entry_available, preferred short name."""
+    return is_video_entry_available(video)
 
 
 def filter_available_videos(videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Return new list containing only available videos.
 
+    Single primary filtering implementation:
+      raw entries -> filter_available_videos -> sort -> preview + download
+
     Does NOT mutate original list. Never crashes on malformed entries.
     If every video is unavailable, returns empty list (caller shows empty state).
+    Does NOT filter based on missing publish_date/thumbnail/title alone.
     """
     if not videos:
         return []
@@ -341,7 +363,6 @@ def filter_available_videos(videos: List[Dict[str, Any]]) -> List[Dict[str, Any]
             if is_video_entry_available(v):
                 available.append(v)
         except Exception:
-            # On any unexpected error, skip that entry rather than failing whole playlist
             continue
     return available
 
