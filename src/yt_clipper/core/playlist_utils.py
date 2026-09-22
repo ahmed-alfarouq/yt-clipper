@@ -188,6 +188,7 @@ _UNAVAILABLE_AVAILABILITY = {
     "private",
     "needs_auth",
     "premium",
+    "premium_only",
     "subscriber_only",
     "unavailable",
     "needs_premium",
@@ -263,6 +264,29 @@ def is_video_entry_available(video: Dict[str, Any]) -> bool:
         return False
     if "video unavailable" in lower_title or "video has been removed" in lower_title:
         return False
+
+    # NEW: Handle lockupViewModel private videos where title=None and availability=None
+    # Actual yt-dlp flat data for private video (boul2gom/yt-dlp#318):
+    #   title=None, availability=None, duration=None, view_count=None,
+    #   channel_url=None, uploader_url=None, channel/channel_id/uploader/uploader_id missing
+    # Available video with missing title would still have channel_url etc.
+    # This is NOT "missing title alone" – it's title empty + no channel info,
+    # which is explicit signal from yt-dlp that video is private.
+    title_empty = not title
+    avail_empty = not availability
+    if title_empty and avail_empty:
+        ch_url = video.get("channel_url")
+        upl_url = video.get("uploader_url")
+        ch = video.get("channel")
+        ch_id = video.get("channel_id")
+        upl = video.get("uploader")
+        upl_id = video.get("uploader_id")
+        # If all channel/uploader fields are missing/None, it's private in flat mode
+        if not ch_url and not upl_url and not ch and not ch_id and not upl and not upl_id:
+            # Also check that duration and view_count are missing (as in actual private data)
+            # to avoid false positives, but channel missing alone is strong signal
+            # We require at least channel missing, which is not expected for public videos
+            return False
 
     # For final normalized entries, ensure http url exists
     # If url was originally id-only, we consider it available if other checks passed,

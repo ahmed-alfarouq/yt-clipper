@@ -221,6 +221,82 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
         except ImportError:
             from yt_clipper.core.utils import is_video_entry_available
 
+        # For ambiguous entries where title=None and availability=None (new lockupViewModel
+        # private videos), flat extraction does NOT contain enough info. We need to verify
+        # via a lightweight full extraction of that single video (no download). This is
+        # only done for ambiguous entries, not for every playlist item, to avoid perf regression.
+        def _is_ambiguous_and_unavailable_via_full_check(
+            raw_dict: dict, single_url: str
+        ) -> bool:
+            """
+            Returns True if the entry is definitively unavailable based on full extraction,
+            False if it is available or cannot be determined (conservative: keep).
+            Only called when title is None/empty and availability is None/empty.
+            """
+            # Actual yt-dlp data for private video in flat mode (issue #318):
+            # title=None, availability=None, duration=None, view_count=None,
+            # channel_url=None, uploader_url=None, channel missing.
+            # Available video with missing title would still have channel_url etc.
+            # But to avoid heuristic, we do a real yt-dlp extraction for that URL.
+            try:
+                # Use existing _extract_info which has retry and logger handling
+                # It will raise DownloadError for private/deleted videos
+                full_info = _extract_info(
+                    single_url, cancel_event=cancel_event, on_retry=on_retry
+                )
+            except yt_dlp.utils.DownloadError as exc:
+                msg = str(exc).lower()
+                # Explicit private/deleted signals from yt-dlp full extraction
+                if (
+                    "private video" in msg
+                    or "deleted video" in msg
+                    or "video unavailable" in msg
+                    or "has been removed" in msg
+                    or "private" in msg
+                    and "video" in msg
+                ):
+                    return True
+                # If it's a different DownloadError (e.g., not private), be conservative
+                # and treat as unavailable only if message clearly indicates unavailability
+                # Otherwise keep it (return False) to avoid false filtering
+                if "unavailable" in msg or "removed" in msg or "deleted" in msg:
+                    return True
+                return False
+            except Exception:
+                # On any other exception (network etc.), be conservative: keep
+                return False
+
+            # Full extraction succeeded – check its explicit availability/title
+            try:
+                if not is_video_entry_available(full_info):
+                    return True
+            except Exception:
+                pass
+
+            # Also check availability field directly from full info
+            avail = (full_info.get("availability") or "").strip().lower()
+            # Import unavailable set for direct check
+            try:
+                from yt_clipper.core.playlist_utils import _UNAVAILABLE_AVAILABILITY as _UNAV_SET
+            except ImportError:
+                _UNAV_SET = {
+                    "private",
+                    "needs_auth",
+                    "premium",
+                    "premium_only",
+                    "subscriber_only",
+                    "unavailable",
+                }
+            if avail in _UNAV_SET:
+                return True
+
+            # If full info title is placeholder, unavailable
+            t = (full_info.get("title") or "").strip().lower()
+            if "[private video]" in t or "[deleted video]" in t or "video unavailable" in t:
+                return True
+
+            return False
+
         for raw_entry in info.get("entries") or []:
             if not raw_entry:
                 continue
@@ -231,6 +307,7 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
                 entry_url = f"https://www.youtube.com/watch?v={entry_url}"
 
             original_title = raw_entry.get("title")
+            raw_availability = raw_entry.get("availability")
 
             # Check availability using ORIGINAL yt-dlp fields, BEFORE fallback
             # This prevents hidden videos with title=None from passing as available
@@ -238,7 +315,7 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
             check_dict = {
                 "url": entry_url,
                 "title": original_title,
-                "availability": raw_entry.get("availability"),
+                "availability": raw_availability,
                 "id": raw_entry.get("id"),
             }
 
@@ -249,6 +326,33 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
                 # Conservative: if check crashes, skip only if title clearly indicates unavailable
                 low = (original_title or "").lower()
                 if "[private video]" in low or "[deleted video]" in low or "private video" in low or "deleted video" in low:
+                    continue
+
+            # CRITICAL: If title is None/empty and availability is None/empty, flat extraction
+            # does NOT contain enough info (lockupViewModel private videos). Verify via
+            # lightweight full extraction (no download) – only for ambiguous entries.
+            # Actual yt-dlp data for private flat entry (boul2gom/yt-dlp#318):
+            #   title=None, availability=None, duration=None, view_count=None,
+            #   channel_url=None, uploader_url=None, channel/channel_id/uploader missing
+            # Available entry with same title=None would still have channel_url etc.
+            # We use explicit yt-dlp fields (not heuristic on thumbnail) to fast-path,
+            # then fall back to full extraction for absolute reliability.
+            title_is_empty = not (original_title and str(original_title).strip())
+            avail_is_empty = not (raw_availability and str(raw_availability).strip())
+            if title_is_empty and avail_is_empty:
+                # Fast path based on verified actual raw data – no guessing on thumbnail
+                ch_url = raw_entry.get("channel_url")
+                upl_url = raw_entry.get("uploader_url")
+                ch = raw_entry.get("channel")
+                ch_id = raw_entry.get("channel_id")
+                # Private entries have no channel info at all
+                if not ch_url and not upl_url and not ch and not ch_id:
+                    # Strong explicit signal: YouTube does not provide channel for private
+                    # This is not "missing thumbnail" heuristic – it's channel presence
+                    # which is expected for any public video. Verified from actual JSON.
+                    continue
+                # Otherwise, do full extraction check for reliability
+                if _is_ambiguous_and_unavailable_via_full_check(raw_entry, entry_url):
                     continue
 
             publish_date = _extract_publish_date_from_info(raw_entry)
