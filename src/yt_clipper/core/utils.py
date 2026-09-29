@@ -17,21 +17,28 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"LPT{i}" for i in range(1, 10)),
 }
 
+def _utf16_len(s):
+    return len(s.encode("utf-16-le")) // 2
+
 def sanitize_filename(name, fallback="clip", max_length=150):
     """Turn an arbitrary string into a filename stem safe on Windows."""
     name = (name or "").strip()
-    name = _WINDOWS_INVALID_CHARS_RE.sub("", name)
+    name = _WINDOWS_INVALID_CHARS_RE.sub(" ", name)
     name = re.sub(r"\s+", " ", name).strip()
     name = name.rstrip(" .")
+
+    # Truncate by UTF-16 units (what Windows counts), leaving room for a "_" prefix
+    while name and _utf16_len(name) > max_length - 1:
+        name = name[:-1]
+    name = name.rstrip(" .")
+
     if not name:
         name = fallback
-    if name.upper() in _WINDOWS_RESERVED_NAMES:
+
+    # Reserved check uses the part before the first dot, ignoring trailing spaces
+    if name.split(".")[0].rstrip(" ").upper() in _WINDOWS_RESERVED_NAMES:
         name = f"_{name}"
-    if len(name) > max_length:
-        name = name[:max_length].rstrip(" .") or fallback
     return name
-
-
 def open_containing_folder(file_path):
     folder = os.path.dirname(os.path.abspath(file_path))
     if sys.platform == "win32":
