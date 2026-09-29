@@ -6,9 +6,13 @@ import threading
 from collections import deque
 from pathlib import Path
 
+# The class lives in core.errors so every layer can honour the cancellation
+# contract without import cycles; re-exported here because core.downloader (and
+# existing callers) import it from this module.
+from yt_clipper.core.errors import DownloadCancelled
+from yt_clipper.core.log import describe_failure, get_logger, redact_secrets
 
-class DownloadCancelled(Exception):
-    """Raised after the user cancels an active clip download."""
+logger = get_logger(__name__)
 
 
 def run_ffmpeg_clip(
@@ -148,6 +152,13 @@ def run_ffmpeg_clip(
         creationflags=creation_flags,
     )
 
+    # Deliberately no command line here: it carries the request headers and
+    # cookies we pass to FFmpeg (§8, §18).
+    logger.debug(
+        "FFmpeg started: output=%s clip_seconds=%.3f audio_only=%s streams=%d",
+        partial_path.name, duration, audio_only, len(formats),
+    )
+
     stdout_lines = queue.Queue()
     stderr_tail = deque(maxlen=40)
     stdout_thread = threading.Thread(
@@ -170,11 +181,16 @@ def run_ffmpeg_clip(
         while process.poll() is None:
             if cancel_event is not None and cancel_event.is_set():
                 _stop_process(process)
+                logger.info(
+                    "FFmpeg clip cancelled by user, discarding %s", partial_path.name
+                )
                 raise DownloadCancelled("Download cancelled")
 
             try:
                 line = stdout_lines.get(timeout=0.1)
             except queue.Empty:
+                # Normal polling tick, not a failure: no progress line yet, so
+                # loop and re-check the cancel event (§3.4 responsiveness).
                 continue
             _consume_progress_line(
                 line,
@@ -188,6 +204,7 @@ def run_ffmpeg_clip(
             try:
                 line = stdout_lines.get_nowait()
             except queue.Empty:
+                # Drain complete: the normal way out of this loop.
                 break
             _consume_progress_line(
                 line,
@@ -198,12 +215,24 @@ def run_ffmpeg_clip(
             )
 
         if cancel_event is not None and cancel_event.is_set():
+            logger.info(
+                "FFmpeg clip cancelled by user, discarding %s", partial_path.name
+            )
             raise DownloadCancelled("Download cancelled")
         if process.returncode != 0:
-            details = "\n".join(stderr_tail).strip()
+            # Keep the existing stderr tail as the diagnostic, but redact it:
+            # FFmpeg can echo back the input URL (and its signature) we fed it.
+            details = redact_secrets("\n".join(stderr_tail).strip())
+            logger.error(
+                "FFmpeg failed with exit code %s while clipping into %s: %s",
+                process.returncode,
+                output_path.name,
+                details or "<FFmpeg produced no stderr>",
+            )
             raise RuntimeError(details or f"FFmpeg exited with code {process.returncode}")
 
         os.replace(partial_path, output_path)
+        logger.debug("FFmpeg clip finished: %s", output_path.name)
         if progress_hook:
             progress_hook(
                 {
@@ -214,6 +243,9 @@ def run_ffmpeg_clip(
                 }
             )
     except BaseException:
+        # Every exit path (failure, cancellation, and even KeyboardInterrupt /
+        # SystemExit) must reach the same terminal cleanup: no orphaned FFmpeg
+        # process and no half-written .part file left behind (§3.6, §8).
         if process.poll() is None:
             _stop_process(process)
         _remove_if_present(partial_path)
@@ -269,8 +301,11 @@ def _elapsed_seconds(state):
     if raw_microseconds:
         try:
             return max(0.0, float(raw_microseconds) / 1_000_000.0)
-        except ValueError:
-            pass
+        except ValueError as exc:
+            # Progress display only: an unparsable timestamp falls through to the
+            # out_time regex below, so this is not a failure of the clip (§18).
+            logger.debug("Unparsable FFmpeg progress timestamp %r: %s",
+                         raw_microseconds, describe_failure(exc))
 
     time_text = state.get("out_time", "")
     match = re.fullmatch(r"(\d+):(\d+):(\d+(?:\.\d+)?)", time_text)
@@ -296,8 +331,11 @@ def _emit_progress(progress_hook, fraction, partial_path, duration, state):
     downloaded_bytes = 0
     try:
         downloaded_bytes = partial_path.stat().st_size
-    except OSError:
-        pass
+    except OSError as exc:
+        # The partial file can momentarily be unreadable (or already renamed on
+        # some platforms); a missing byte count must not fail the clip (§8).
+        logger.debug("Could not stat %s for progress: %s",
+                     partial_path.name, describe_failure(exc))
 
     progress_hook(
         {
@@ -326,18 +364,33 @@ def _format_eta(seconds):
 
 
 def _stop_process(process):
+    """Stop FFmpeg, escalating terminate -> kill.
+
+    Never raises: a stuck process must not replace the operation's real outcome
+    (SUCCESS / CANCELLED / FAILURE) with a TimeoutExpired raised by our own
+    cleanup (§8).
+    """
     if process.poll() is not None:
         return
     process.terminate()
     try:
         process.wait(timeout=3)
     except subprocess.TimeoutExpired:
+        logger.warning("FFmpeg ignored terminate; escalating to kill")
         process.kill()
-        process.wait(timeout=3)
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "FFmpeg still running after kill; abandoning the wait so the "
+                "operation's own outcome is reported instead"
+            )
 
 
 def _remove_if_present(path):
     try:
         path.unlink()
     except FileNotFoundError:
+        # Idempotent cleanup: an already-absent partial file is the desired
+        # end state, not an error (§8 .part semantics).
         pass

@@ -4,6 +4,7 @@ Playlist-specific utilities: availability, filtering, sorting, publish-date hand
 This module is intentionally small and focused, keeping core/utils.py from becoming a dumping ground.
 It provides the single authoritative implementation for:
 
+- classify_video_entry (tri-state: available / unavailable / unknown)
 - is_video_available / is_video_entry_available
 - filter_available_videos
 - sort_videos_by_publish_date
@@ -13,18 +14,25 @@ It provides the single authoritative implementation for:
 Flow:
   raw yt-dlp entries
       ↓
-  filter_available_videos()  <- uses is_video_entry_available()
+  classify_video_entry()      <- explicit signals only
+      ↓
+  unavailable → dropped · available → kept · unknown → resolved by the caller
+      ↓
+  filter_available_videos()   <- uses is_video_entry_available()
       ↓
   sort_videos_by_publish_date()
       ↓
   shared playlist state -> Preview + Download
 """
 
-import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import math as _math
 from urllib.parse import urlparse, parse_qs
+
+from yt_clipper.core.log import describe_failure, get_logger
+
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -40,11 +48,16 @@ def _parse_upload_date_str(value: str) -> Optional[datetime]:
         try:
             return datetime.strptime(v, "%Y%m%d").replace(tzinfo=timezone.utc)
         except ValueError:
+            # Format probe, not a failure (§12): an unrecognised upload date
+            # simply means "no date", which sorts last and renders as
+            # "Unknown date". Nothing is discarded and no operation fails.
             return None
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"):
         try:
             return datetime.strptime(v[:10], fmt).replace(tzinfo=timezone.utc)
         except ValueError:
+            # Next candidate format; the loop's outcome (None) is documented
+            # above, so a per-format miss is not worth a log record.
             continue
     return None
 
@@ -62,6 +75,8 @@ def parse_publish_date(value: Any) -> Optional[datetime]:
             if _math.isnan(float(value)) or _math.isinf(float(value)):
                 return None
         except Exception:
+            # A value that cannot even be floated is simply "no date" (§12).
+            # Broad on purpose: the input comes from arbitrary yt-dlp metadata.
             return None
         ts = float(value)
         if ts > 1e12:
@@ -71,6 +86,7 @@ def parse_publish_date(value: Any) -> Optional[datetime]:
         try:
             return datetime.fromtimestamp(ts, tz=timezone.utc)
         except (OverflowError, OSError, ValueError):
+            # Platform-specific timestamp limits: "no date", never a failure.
             return None
     if isinstance(value, str):
         s = value.strip()
@@ -83,6 +99,7 @@ def parse_publish_date(value: Any) -> Optional[datetime]:
             num = float(s)
             return parse_publish_date(num)
         except ValueError:
+            # Format probe, not a failure: the ISO attempt below still runs.
             pass
         try:
             iso = s.replace("Z", "+00:00")
@@ -90,7 +107,10 @@ def parse_publish_date(value: Any) -> Optional[datetime]:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
-        except Exception:
+        except Exception as exc:
+            # Optional display metadata: no recognised date simply sorts last
+            # and renders as "Unknown date" (§12).
+            logger.debug("Unrecognised publish date %r: %s", s, describe_failure(exc))
             return None
     return None
 
@@ -130,7 +150,12 @@ def sort_videos_by_publish_date(videos: List[Dict[str, Any]]) -> List[Dict[str, 
     for idx, v in enumerate(videos):
         try:
             dt = extract_publish_date(v)
-        except Exception:
+        except Exception as exc:
+            # Sorting is presentation-only: an entry without a usable date keeps
+            # its place at the end instead of failing the whole sort (§12).
+            logger.debug("Publish date unavailable while sorting entry %r: %s",
+                         v.get("id") if isinstance(v, dict) else v,
+                         describe_failure(exc))
             dt = None
         if dt is None:
             sort_key = (1, datetime.max.replace(tzinfo=timezone.utc), idx)
@@ -152,12 +177,15 @@ def format_publish_date(value: Any) -> str:
         return "Unknown date"
     try:
         return dt.strftime("%B %d, %Y")
-    except Exception:
+    except Exception as exc:
+        # Display-only fallback (e.g. a year outside the platform's strftime
+        # range): the row still renders, so this is not an operation failure.
+        logger.debug("Could not format publish date %r: %s", dt, describe_failure(exc))
         return "Unknown date"
 
 
 # ---------------------------------------------------------------------------
-# Availability filtering
+# Availability classification
 # ---------------------------------------------------------------------------
 
 # yt-dlp flat playlist entries (extract_flat: in_playlist) come from
@@ -169,11 +197,18 @@ def format_publish_date(value: Any) -> str:
 #     derived from badges AVAILABILITY_PRIVATE/PREMIUM/SUBSCRIPTION
 #   - thumbnails, duration, timestamp may be missing in flat mode
 #
-# Unavailable signaled explicitly by yt-dlp via:
+# UNAVAILABLE is only ever decided from an explicit signal:
 #   - availability field
 #   - title placeholders
+#   - no URL at all (nothing could be downloaded)
 # We must NOT use weak checks like title presence, thumbnail presence, id presence
-# or publish date presence alone.
+# or publish date presence alone. A flat entry can legitimately omit title,
+# availability, duration and channel metadata, so "not enough data" is a third
+# state (UNKNOWN) that the caller has to resolve - never a silent drop.
+
+AVAILABILITY_AVAILABLE = "available"
+AVAILABILITY_UNAVAILABLE = "unavailable"
+AVAILABILITY_UNKNOWN = "unknown"
 
 _UNAVAILABLE_TITLE_MARKERS = (
     "[private video]",
@@ -199,106 +234,111 @@ _UNAVAILABLE_AVAILABILITY = {
     "deleted",
 }
 
+# Presence of any of these means YouTube returned a real video object for the
+# entry. Private/deleted lockupViewModel entries omit every one of them
+# (verified from actual yt-dlp JSON, boul2gom/yt-dlp#318), so they are positive
+# evidence of availability. Their *absence* is only "unknown", never
+# "unavailable" - that distinction is the whole point of the third state.
+_AVAILABILITY_EVIDENCE_KEYS = (
+    "channel",
+    "channel_id",
+    "channel_url",
+    "uploader",
+    "uploader_id",
+    "uploader_url",
+    "duration",
+    "view_count",
+)
 
-def is_video_entry_available(video: Dict[str, Any]) -> bool:
-    """Determine if a yt-dlp flat playlist entry is usable by download pipeline.
 
-    Uses metadata already obtained by playlist extraction, no extra network.
+def _field_text(value: Any) -> str:
+    """Best-effort stripped text of a metadata field.
 
-    Available even if:
-      - publish_date is None (sorted to end)
-      - thumbnail is None (fallback used)
-      - title is missing/empty (fallback elsewhere, but still downloadable)
-      - duration is missing (flat entries don't have duration)
-
-    Unavailable when yt-dlp explicitly indicates inaccessibility:
-      - availability in _UNAVAILABLE_AVAILABILITY
-      - title is "[Private video]", "[Deleted video]", "[Unavailable]" etc.
-      - url missing or not http (cannot construct valid download)
-      - entry is None/empty
-
-    Single source of truth for availability; preview and download must share filtered result.
+    Keeps classification total: None, booleans, empty/zero values, containers
+    and unexpected object types all mean "field absent" instead of raising
+    AttributeError on .strip().
     """
-    if not video or not isinstance(video, dict):
-        return False
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ""
+    if not value:
+        return ""
+    return str(value)
 
-    # URL required for download pipeline
-    url = video.get("url") or video.get("webpage_url") or ""
-    if not isinstance(url, str) or not url.startswith("http"):
-        # For raw flat entries where url may be just id, we allow id-based check
-        # to avoid false negatives, but require that title/availability not indicate unavailable
-        # However for final normalized entries, url must be http
-        # To keep function usable for both raw and normalized, we check:
-        # if url is just id (no http) but looks like youtube id, we don't fail here,
-        # we let availability/title checks decide. But for safety, if url is empty, fail.
-        if not url:
-            return False
-        # If url is not http but is a plausible video id (11 chars), allow further checks
-        # Otherwise fail
-        if not re.match(r'^[A-Za-z0-9_-]{11}$', str(url).strip()):
-            # If it's not http and not a video id, it's invalid
-            # But to avoid weak check, we only fail if it's clearly not a valid id/url
-            # For transformed entries, we require http, so this will be False
-            # For raw entries with id, we continue
-            if not str(url).startswith("http"):
-                # Check if it's an id-like string; if not, treat as unavailable
-                # Actually for raw entries, url may be id, so we should not reject yet
-                # We'll only reject if both url and webpage_url missing
-                pass
 
-    # Explicit availability signal from yt-dlp badges
-    availability = (video.get("availability") or "").strip().lower()
+def classify_video_entry(video: Dict[str, Any]) -> str:
+    """Classify one yt-dlp entry (flat or full) into one of three states.
+
+      AVAILABILITY_UNAVAILABLE - yt-dlp/YouTube explicitly marks it private,
+                                 deleted, removed, premium/auth-only or
+                                 unavailable, or it carries no URL to download.
+      AVAILABILITY_AVAILABLE   - positive evidence of a real video: a usable
+                                 title, an explicit availability value that is
+                                 not one of the unavailable ones, or any
+                                 channel/uploader/duration/view_count metadata.
+      AVAILABILITY_UNKNOWN     - the entry proves nothing either way. The caller
+                                 must resolve it (a single-video full
+                                 extraction) instead of discarding it.
+
+    Single source of truth for availability. Never raises.
+    """
+    if not isinstance(video, dict) or not video:
+        return AVAILABILITY_UNAVAILABLE
+
+    # Nothing can be downloaded without a URL. Raw flat entries may carry a bare
+    # video id; callers expand it to a watch URL before classifying.
+    if not (_field_text(video.get("url")) or _field_text(video.get("webpage_url"))):
+        return AVAILABILITY_UNAVAILABLE
+
+    # Explicit availability signal from yt-dlp badges.
+    availability = _field_text(video.get("availability")).lower()
     if availability in _UNAVAILABLE_AVAILABILITY:
-        return False
+        return AVAILABILITY_UNAVAILABLE
 
-    # Title placeholders yt-dlp uses for hidden/deleted/private
-    title = (video.get("title") or "").strip()
+    # Title placeholders yt-dlp uses for hidden/deleted/private entries.
+    title = _field_text(video.get("title"))
     lower_title = title.lower()
-
     if lower_title in _UNAVAILABLE_TITLE_MARKERS:
-        return False
+        return AVAILABILITY_UNAVAILABLE
     for marker in _UNAVAILABLE_TITLE_MARKERS:
         if lower_title.startswith(marker):
-            return False
+            return AVAILABILITY_UNAVAILABLE
     if "[private video]" in lower_title or "[deleted video]" in lower_title:
-        return False
+        return AVAILABILITY_UNAVAILABLE
     if "video unavailable" in lower_title or "video has been removed" in lower_title:
-        return False
+        return AVAILABILITY_UNAVAILABLE
 
-    # NEW: Handle lockupViewModel private videos where title=None and availability=None
-    # Actual yt-dlp flat data for private video (boul2gom/yt-dlp#318):
-    #   title=None, availability=None, duration=None, view_count=None,
-    #   channel_url=None, uploader_url=None, channel/channel_id/uploader/uploader_id missing
-    # Available video with missing title would still have channel_url etc.
-    # This is NOT "missing title alone" – it's title empty + no channel info,
-    # which is explicit signal from yt-dlp that video is private.
-    title_empty = not title
-    avail_empty = not availability
-    if title_empty and avail_empty:
-        ch_url = video.get("channel_url")
-        upl_url = video.get("uploader_url")
-        ch = video.get("channel")
-        ch_id = video.get("channel_id")
-        upl = video.get("uploader")
-        upl_id = video.get("uploader_id")
-        # If all channel/uploader fields are missing/None, it's private in flat mode
-        if not ch_url and not upl_url and not ch and not ch_id and not upl and not upl_id:
-            # Also check that duration and view_count are missing (as in actual private data)
-            # to avoid false positives, but channel missing alone is strong signal
-            # We require at least channel missing, which is not expected for public videos
-            return False
+    # Positive evidence, cheapest and strongest first.
+    if title:
+        return AVAILABILITY_AVAILABLE
+    if availability:
+        # Any other explicit value ("public", "unlisted", ...) means YouTube
+        # described a real, reachable video.
+        return AVAILABILITY_AVAILABLE
+    for key in _AVAILABILITY_EVIDENCE_KEYS:
+        if _field_text(video.get(key)):
+            return AVAILABILITY_AVAILABLE
 
-    # For final normalized entries, ensure http url exists
-    # If url was originally id-only, we consider it available if other checks passed,
-    # because downloader will convert id to full url. But if after normalization
-    # url is still not http, it cannot be downloaded.
-    # To enforce this for normalized entries, we check if url is http or id,
-    # but if title is empty and url is id, we still allow (missing title != unavailable)
-    # The definitive http check happens after normalization in downloader.
-    # Here we only reject if url is empty.
+    # No explicit signal and no positive evidence: insufficient metadata.
+    return AVAILABILITY_UNKNOWN
 
-    # Otherwise available
-    return True
+
+def is_video_entry_available(video: Dict[str, Any]) -> bool:
+    """True unless the entry is *explicitly* unavailable.
+
+    Thin boolean view over classify_video_entry(), kept for the existing callers
+    (filter_available_videos and the downloader's defensive checks). UNKNOWN
+    counts as available here on purpose: silently discarding a video just
+    because its flat metadata was thin is exactly the failure this guards
+    against. expand_playlist() resolves UNKNOWN entries with a full extraction
+    of that single video before they can reach the preview or the queue, and
+    normalized entries always carry a title, so they classify as AVAILABLE.
+
+    Single source of truth for availability; preview and download must share
+    the filtered result.
+    """
+    return classify_video_entry(video) is not AVAILABILITY_UNAVAILABLE
 
 
 def is_video_available(video: Dict[str, Any]) -> bool:
@@ -307,13 +347,21 @@ def is_video_available(video: Dict[str, Any]) -> bool:
 
 
 def filter_available_videos(videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Return new list containing only available videos.
+    """Return new list containing only videos that are not explicitly unavailable.
 
     Single primary filtering implementation:
       raw entries -> filter_available_videos -> sort -> preview + download
 
+    Drops AVAILABILITY_UNAVAILABLE entries only; AVAILABILITY_AVAILABLE and
+    AVAILABILITY_UNKNOWN entries are kept (see classify_video_entry).
+
     Does NOT mutate original list. Never crashes. Returns [] if all unavailable.
     Does NOT filter based on missing publish_date/thumbnail/title alone.
+
+    Failure contract (§4): an entry whose availability cannot be determined
+    because the check itself raised is KEPT and reported at WARNING. Only an
+    explicit "unavailable" answer removes a video - an internal error must never
+    silently shrink the user's playlist.
     """
     if not videos:
         return []
@@ -322,8 +370,17 @@ def filter_available_videos(videos: List[Dict[str, Any]]) -> List[Dict[str, Any]
         try:
             if is_video_entry_available(v):
                 available.append(v)
-        except Exception:
-            continue
+        except Exception as exc:
+            # Keep the entry FIRST and explain without touching it again: the
+            # object that broke the check may break a second time, and a
+            # diagnostic that raises would turn a recoverable warning into a
+            # failure of the whole filter (§4, §21).
+            available.append(v)
+            logger.warning(
+                "Availability check raised for a playlist entry; keeping it "
+                "instead of dropping a possibly valid video: %s",
+                describe_failure(exc),
+            )
     return available
 
 
@@ -381,7 +438,12 @@ def detect_youtube_url_type(url: str) -> str:
 
         return "video"
 
-    except Exception:
+    except Exception as exc:
+        # Fail safe: an URL we cannot parse is treated as "not a playlist" so a
+        # single-video clip still works. Logged because a misrouted playlist URL
+        # would otherwise be invisible (§4, §18).
+        logger.warning("Could not classify YouTube URL %r; treating it as unknown: %s",
+                       u, describe_failure(exc))
         return "unknown"
 
 

@@ -1,14 +1,19 @@
 import os
 import random
 import time
+from collections import deque
 from typing import Any, cast
 
 import yt_dlp
 import yt_dlp.utils  # explicit submodule import so `yt_dlp.utils.DownloadError` resolves
 from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 
-from yt_clipper.core.ffmpeg_runner import DownloadCancelled, run_ffmpeg_clip
+from yt_clipper.core.errors import DownloadCancelled
+from yt_clipper.core.ffmpeg_runner import run_ffmpeg_clip
 from yt_clipper.core.js_runtime import build_ydl_js_runtime_option
+from yt_clipper.core.log import describe_failure, get_logger, redact_secrets, safe_message
+
+logger = get_logger(__name__)
 
 
 FORMAT_MAP = {
@@ -32,29 +37,61 @@ class _FilteredYtDlpLogger:
       are still raised as DownloadError exceptions and surfaced via UI.
     - Other warnings are suppressed to keep UI clean (quiet=True already does),
       but the specific unavailable-video message is explicitly ignored.
+
+    Failure contract (§19): debug/info stay silent, expected "unavailable video"
+    warnings stay silent, unexpected warnings are recorded at DEBUG, and
+    error-level messages are forwarded to the real logging path - redacted and
+    de-duplicated - so a genuine failure is observable even when the caller
+    only sees a generic DownloadError. One instance is created per extraction
+    (see `_get_ydl_logger_option`), so the de-duplication window is exactly one
+    yt-dlp run and needs no locking.
     """
 
+    #: How many distinct error messages one run remembers for de-duplication.
+    _MAX_REMEMBERED_ERRORS = 16
+
+    def __init__(self, error_logger=None):
+        self._error_logger = error_logger or logger
+        self._recent_errors: deque[str] = deque(maxlen=self._MAX_REMEMBERED_ERRORS)
+
     def debug(self, msg):
+        # Per-chunk extractor chatter: intentionally not observable (§19).
         pass
 
     def info(self, msg):
+        # Same as debug: quiet=True already suppresses the user-facing copy.
         pass
 
     def warning(self, msg):
         try:
             lower = str(msg).lower()
-            if "unavailable video" in lower and "hidden" in lower:
-                return
-            if "youtube said" in lower and "unavailable" in lower:
-                return
-            if "youtube said: info" in lower:
-                return
-        except Exception:
-            pass
-        pass
+        except Exception as exc:
+            # The filter itself must never turn a warning into a failure.
+            logger.debug("yt-dlp warning could not be inspected: %s",
+                         describe_failure(exc))
+            return
+        if "unavailable video" in lower and "hidden" in lower:
+            return
+        if "youtube said" in lower and "unavailable" in lower:
+            return
+        if "youtube said: info" in lower:
+            return
+        # Any other warning: expected noise for the user, useful for diagnosis.
+        logger.debug("yt-dlp warning: %s", redact_secrets(str(msg)))
 
     def error(self, msg):
-        pass
+        """Forward yt-dlp error-level messages to the logging path (§19)."""
+        text = redact_secrets(str(msg)).strip()
+        if not text:
+            return
+        key = " ".join(text.split())
+        if key in self._recent_errors:
+            # yt-dlp can report one failure through several channels; keep the
+            # log free of repeats without losing the first occurrence.
+            logger.debug("yt-dlp repeated error (already logged): %s", text)
+            return
+        self._recent_errors.append(key)
+        self._error_logger.error("yt-dlp: %s", text)
 
 
 def _get_ydl_logger_option():
@@ -83,15 +120,30 @@ def _retry_call(func, cancel_event=None, on_retry=None,
     attempt = 1
     while True:
         if cancel_event is not None and cancel_event.is_set():
+            # Cancellation is an expected outcome, never a failure: recorded at
+            # INFO and propagated untouched (§3).
+            logger.info("Cancelled before attempt %d of the current operation", attempt)
             raise DownloadCancelled("Download cancelled")
         try:
             return func()
         except DownloadCancelled:
             raise
         except Exception as exc:
-            if attempt >= max_attempts or not _is_transient_error(exc):
+            if not _is_transient_error(exc):
+                # Not our retryable class: the caller decides how to report it.
+                logger.debug("Not retrying: %s", describe_failure(exc))
+                raise
+            if attempt >= max_attempts:
+                # Exhausted retries must be observable, not silent (§10).
+                logger.warning(
+                    "Giving up after %d attempt(s): %s", attempt, describe_failure(exc)
+                )
                 raise
             delay = base_delay * (2 ** (attempt - 1)) * random.uniform(0.85, 1.15)
+            logger.debug(
+                "Transient failure (attempt %d/%d), retrying in %.1fs: %s",
+                attempt, max_attempts, delay, describe_failure(exc),
+            )
             if on_retry:
                 on_retry(attempt, max_attempts, delay, exc)
             _sleep_cancellable(delay, cancel_event)
@@ -142,14 +194,23 @@ def _reject_playlist(info):
 
 
 def _extract_publish_date_from_info(info):
+    """Optional metadata: any failure falls back to None, never aborts (§12)."""
     try:
         from yt_clipper.core.playlist_utils import extract_publish_date
         return extract_publish_date(info)
-    except Exception:
+    except Exception as exc:
+        logger.debug("playlist_utils.extract_publish_date unavailable (%s); "
+                     "trying the legacy location", describe_failure(exc))
         try:
             from yt_clipper.core.utils import extract_publish_date
             return extract_publish_date(info)
-        except Exception:
+        except Exception as fallback_exc:
+            # A missing publish date only affects sorting/display, so the
+            # operation continues with the documented fallback (§12).
+            logger.warning(
+                "Could not determine publish date; continuing without it: %s",
+                describe_failure(fallback_exc),
+            )
             return None
 
 
@@ -186,15 +247,16 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
           ↓
       RAW entries
           ↓
-      is_video_entry_available() on ORIGINAL title/availability (before fallback)
+      classify_video_entry() on ORIGINAL fields (before the title fallback)
           ↓
-      REMOVE unavailable completely
+      UNAVAILABLE → removed completely
+      AVAILABLE   → kept
+      UNKNOWN     → full extraction of that single video → kept unless the
+                    full result is itself explicitly unavailable
           ↓
-      VALIDATED entries
+      VALIDATED entries (missing flat metadata filled in from the full check)
           ↓
-      sort by publish date
-          ↓
-      shared state -> Preview + Download
+      shared state -> Preview + Download (sorting happens in the GUI layer)
     """
     ydl_options: dict[str, Any] = {
         "quiet": True,
@@ -217,177 +279,197 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
     if info.get("_type") == "playlist" or "entries" in info:
         raw_entries = []
         try:
-            from yt_clipper.core.playlist_utils import is_video_entry_available
-        except ImportError:
-            from yt_clipper.core.utils import is_video_entry_available
+            from yt_clipper.core import playlist_utils
+        except ImportError as exc:
+            logger.debug("Falling back to legacy core.utils for playlist helpers: %s",
+                         describe_failure(exc))
+            from yt_clipper.core import utils as playlist_utils
 
-        # For ambiguous entries where title=None and availability=None (new lockupViewModel
-        # private videos), flat extraction does NOT contain enough info. We need to verify
-        # via a lightweight full extraction of that single video (no download). This is
-        # only done for ambiguous entries, not for every playlist item, to avoid perf regression.
-        def _is_ambiguous_and_unavailable_via_full_check(
-            raw_dict: dict, single_url: str
-        ) -> bool:
+        def _resolve_ambiguous_entry(single_url: str):
+            """Resolve one flat entry whose metadata proves nothing either way.
+
+            Returns (keep, full_info). keep is False only when a full extraction
+            of that single video *explicitly* reports it as private/deleted/
+            unavailable. An available result - or an error we cannot interpret -
+            keeps the entry, because silently discarding a valid video is worse
+            than letting yt-dlp report a genuine failure at download time.
+            full_info is returned so the caller can fill in the metadata the
+            flat entry was missing (title, duration, thumbnail, dates) instead
+            of showing the raw URL as the title.
             """
-            Returns True if the entry is definitively unavailable based on full extraction,
-            False if it is available or cannot be determined (conservative: keep).
-            Only called when title is None/empty and availability is None/empty.
-            """
-            # Actual yt-dlp data for private video in flat mode (issue #318):
-            # title=None, availability=None, duration=None, view_count=None,
-            # channel_url=None, uploader_url=None, channel missing.
-            # Available video with missing title would still have channel_url etc.
-            # But to avoid heuristic, we do a real yt-dlp extraction for that URL.
             try:
-                # Use existing _extract_info which has retry and logger handling
-                # It will raise DownloadError for private/deleted videos
+                # Reuses the shared single-video extraction, so this gets the
+                # same retry / filtered-logger / js-runtime handling as the rest
+                # of the module, and no download is performed.
                 full_info = _extract_info(
                     single_url, cancel_event=cancel_event, on_retry=on_retry
                 )
             except yt_dlp.utils.DownloadError as exc:
                 msg = str(exc).lower()
-                # Explicit private/deleted signals from yt-dlp full extraction
+                # Explicit private/deleted/unavailable signals from yt-dlp.
                 if (
                     "private video" in msg
                     or "deleted video" in msg
                     or "video unavailable" in msg
                     or "has been removed" in msg
-                    or "private" in msg
-                    and "video" in msg
+                    or ("private" in msg and "video" in msg)
+                    or "unavailable" in msg
+                    or "removed" in msg
+                    or "deleted" in msg
                 ):
-                    return True
-                # If it's a different DownloadError (e.g., not private), be conservative
-                # and treat as unavailable only if message clearly indicates unavailability
-                # Otherwise keep it (return False) to avoid false filtering
-                if "unavailable" in msg or "removed" in msg or "deleted" in msg:
-                    return True
-                return False
-            except Exception:
-                # On any other exception (network etc.), be conservative: keep
-                return False
+                    # Expected condition, not an error (§18): a private/deleted
+                    # video is filtered out on purpose.
+                    logger.info(
+                        "Playlist entry %s reported unavailable (%s); skipped",
+                        redact_secrets(single_url), safe_message(exc),
+                    )
+                    return False, None
+                # Some other DownloadError (geo-blocked, age-restricted, ...):
+                # keep it and let the download itself report the problem.
+                logger.warning(
+                    "Availability check for %s was inconclusive (%s); keeping the "
+                    "entry so the download can report a real failure",
+                    redact_secrets(single_url), safe_message(exc),
+                )
+                return True, None
+            except DownloadCancelled:
+                # Cancellation must keep propagating to the caller/UI (§3).
+                raise
+            except Exception as exc:
+                # Network or unexpected failure while checking: keep (conservative).
+                logger.warning(
+                    "Availability check for %s failed (%s); keeping the entry "
+                    "rather than dropping a possibly valid video",
+                    redact_secrets(single_url), describe_failure(exc),
+                )
+                return True, None
 
-            # Full extraction succeeded – check its explicit availability/title
-            try:
-                if not is_video_entry_available(full_info):
-                    return True
-            except Exception:
-                pass
-
-            # Also check availability field directly from full info
-            avail = (full_info.get("availability") or "").strip().lower()
-            # Import unavailable set for direct check
-            try:
-                from yt_clipper.core.playlist_utils import _UNAVAILABLE_AVAILABILITY as _UNAV_SET
-            except ImportError:
-                _UNAV_SET = {
-                    "private",
-                    "needs_auth",
-                    "premium",
-                    "premium_only",
-                    "subscriber_only",
-                    "unavailable",
-                }
-            if avail in _UNAV_SET:
-                return True
-
-            # If full info title is placeholder, unavailable
-            t = (full_info.get("title") or "").strip().lower()
-            if "[private video]" in t or "[deleted video]" in t or "video unavailable" in t:
-                return True
-
-            return False
+            if not isinstance(full_info, dict):
+                logger.debug(
+                    "Full extraction for %s returned %s; keeping the entry "
+                    "without extra metadata", single_url, type(full_info).__name__,
+                )
+                return True, None
+            # The full result carries complete metadata, so the shared
+            # classifier can now give a definitive answer. The URL is filled in
+            # because we already know it: a full result that happens to omit
+            # webpage_url must not be mistaken for "nothing to download".
+            full_check_target = dict(full_info)
+            full_check_target.setdefault("url", single_url)
+            decision = playlist_utils.classify_video_entry(full_check_target)
+            if decision is playlist_utils.AVAILABILITY_UNAVAILABLE:
+                return False, None
+            return True, full_info
 
         for raw_entry in info.get("entries") or []:
             if not raw_entry:
+                # An empty entry carries nothing to clip; skipping it must still
+                # be visible so a shrinking playlist is explainable (§4, §18).
+                logger.warning("Playlist entry was empty; skipped")
                 continue
             entry_url = raw_entry.get("url") or raw_entry.get("webpage_url") or raw_entry.get("id")
             if not entry_url:
+                logger.warning(
+                    "Playlist entry %r has no usable URL or id; skipped",
+                    raw_entry.get("title") if isinstance(raw_entry, dict) else raw_entry,
+                )
                 continue
             if not str(entry_url).startswith("http"):
                 entry_url = f"https://www.youtube.com/watch?v={entry_url}"
 
-            original_title = raw_entry.get("title")
-            raw_availability = raw_entry.get("availability")
+            # Classify from the ORIGINAL yt-dlp fields (before the title->url
+            # fallback below), so placeholder titles such as "[Private video]"
+            # are still detected. The whole raw entry is passed on purpose: its
+            # channel/uploader/duration fields are positive evidence that the
+            # video exists, and dropping them is what used to make thin-but-valid
+            # entries look private.
+            check_dict = dict(raw_entry) if isinstance(raw_entry, dict) else {}
+            check_dict["url"] = entry_url
+            decision = playlist_utils.classify_video_entry(check_dict)
+            if decision is playlist_utils.AVAILABILITY_UNAVAILABLE:
+                # Expected filtering, never an error (§18): recorded at INFO so
+                # "why is this video missing from my list?" stays answerable.
+                logger.info(
+                    "Playlist entry %s is explicitly unavailable; skipped", entry_url
+                )
+                continue
 
-            # Check availability using ORIGINAL yt-dlp fields, BEFORE fallback
-            # This prevents hidden videos with title=None from passing as available
-            # because we would otherwise fallback title to url and miss placeholder detection
-            check_dict = {
-                "url": entry_url,
-                "title": original_title,
-                "availability": raw_availability,
-                "id": raw_entry.get("id"),
-            }
-
-            try:
-                if not is_video_entry_available(check_dict):
-                    continue
-            except Exception:
-                # Conservative: if check crashes, skip only if title clearly indicates unavailable
-                low = (original_title or "").lower()
-                if "[private video]" in low or "[deleted video]" in low or "private video" in low or "deleted video" in low:
-                    continue
-
-            # CRITICAL: If title is None/empty and availability is None/empty, flat extraction
-            # does NOT contain enough info (lockupViewModel private videos). Verify via
-            # lightweight full extraction (no download) – only for ambiguous entries.
-            # Actual yt-dlp data for private flat entry (boul2gom/yt-dlp#318):
-            #   title=None, availability=None, duration=None, view_count=None,
-            #   channel_url=None, uploader_url=None, channel/channel_id/uploader missing
-            # Available entry with same title=None would still have channel_url etc.
-            # We use explicit yt-dlp fields (not heuristic on thumbnail) to fast-path,
-            # then fall back to full extraction for absolute reliability.
-            title_is_empty = not (original_title and str(original_title).strip())
-            avail_is_empty = not (raw_availability and str(raw_availability).strip())
-            if title_is_empty and avail_is_empty:
-                # Fast path based on verified actual raw data – no guessing on thumbnail
-                ch_url = raw_entry.get("channel_url")
-                upl_url = raw_entry.get("uploader_url")
-                ch = raw_entry.get("channel")
-                ch_id = raw_entry.get("channel_id")
-                # Private entries have no channel info at all
-                if not ch_url and not upl_url and not ch and not ch_id:
-                    # Strong explicit signal: YouTube does not provide channel for private
-                    # This is not "missing thumbnail" heuristic – it's channel presence
-                    # which is expected for any public video. Verified from actual JSON.
-                    continue
-                # Otherwise, do full extraction check for reliability
-                if _is_ambiguous_and_unavailable_via_full_check(raw_entry, entry_url):
+            # UNKNOWN means the flat listing carried no explicit signal and no
+            # positive evidence (lockupViewModel entries can omit title,
+            # availability AND channel metadata). That is not proof of
+            # unavailability, so verify this single video with a lightweight full
+            # extraction - only for ambiguous entries, never for the whole
+            # playlist, to avoid a per-item network round trip.
+            full_info = None
+            if decision is playlist_utils.AVAILABILITY_UNKNOWN:
+                keep, full_info = _resolve_ambiguous_entry(entry_url)
+                if not keep:
                     continue
 
-            publish_date = _extract_publish_date_from_info(raw_entry)
+            # Fill in only what the flat entry was missing; never overwrite data
+            # yt-dlp already gave us for the playlist item.
+            source_entry = raw_entry if isinstance(raw_entry, dict) else {}
+            if full_info:
+                source_entry = dict(source_entry)
+                for key, value in full_info.items():
+                    if value is not None and source_entry.get(key) is None:
+                        source_entry[key] = value
+
+            publish_date = _extract_publish_date_from_info(source_entry)
             raw_entries.append({
                 "url": entry_url,
-                "title": original_title or entry_url,
-                "duration": raw_entry.get("duration"),
-                "thumbnail": _best_thumbnail_url(raw_entry),
+                "title": source_entry.get("title") or entry_url,
+                "duration": source_entry.get("duration"),
+                "thumbnail": _best_thumbnail_url(source_entry),
                 "publish_date": publish_date,
-                "upload_date": raw_entry.get("upload_date"),
-                "timestamp": raw_entry.get("timestamp"),
-                "release_timestamp": raw_entry.get("release_timestamp"),
-                "availability": raw_entry.get("availability"),
+                "upload_date": source_entry.get("upload_date"),
+                "timestamp": source_entry.get("timestamp"),
+                "release_timestamp": source_entry.get("release_timestamp"),
+                "availability": source_entry.get("availability"),
             })
 
         if not raw_entries:
             original_count = len(list(info.get("entries") or []))
             if original_count > 0:
+                # EXPECTED_EMPTY, not a failure: every entry was explicitly
+                # unavailable, which the user is told about through the UI (§2).
+                logger.info(
+                    "Playlist %r listed %d entr(y/ies) but none are available",
+                    info.get("title"), original_count,
+                )
                 return {
                     "is_playlist": True,
                     "playlist_title": info.get("title"),
                     "entries": [],
                 }
+            # yt-dlp gave us an empty listing: still a user-visible failure
+            # (reported by the caller), so record it without duplicating the
+            # message the CLI/GUI already shows (§17, §18).
+            logger.info("Playlist %r returned no entries at all", redact_secrets(url))
             raise ValueError("This playlist has no videos, or they're all unavailable.")
 
         # Defensive second filter using shared utility
         try:
             from yt_clipper.core.playlist_utils import filter_available_videos
-        except ImportError:
+        except ImportError as exc:
+            logger.debug("Falling back to legacy utils.filter_available_videos: %s",
+                         describe_failure(exc))
             from yt_clipper.core.utils import filter_available_videos
         try:
             entries = filter_available_videos(raw_entries)
-        except Exception:
+        except Exception as exc:
+            # Fail-open on purpose: a broken second filter must not discard an
+            # already validated playlist, and the fallback must be visible (§4).
+            logger.warning(
+                "Secondary availability filter failed; keeping the %d already "
+                "validated entries: %s", len(raw_entries), describe_failure(exc),
+            )
             entries = raw_entries
 
+        logger.info(
+            "Playlist %r resolved to %d downloadable video(s)",
+            info.get("title"), len(entries),
+        )
         return {
             "is_playlist": True,
             "playlist_title": info.get("title"),
@@ -467,13 +549,22 @@ def download_clip(
     if start_sec is not None and end_sec is not None and end_sec <= start_sec:
         raise ValueError("End time must be after start time")
     if cancel_event is not None and cancel_event.is_set():
+        # Already cancelled before any work started: report CANCELLED, do not
+        # begin a download the user asked to stop (§3.4).
+        logger.info("Clip request cancelled before it started: %s", redact_secrets(url))
         raise DownloadCancelled("Download cancelled")
+    logger.info(
+        "Clip requested: %s range=%s-%s audio_only=%s -> %s",
+        redact_secrets(url), start_sec, end_sec, audio_only, output_path,
+    )
 
     # Defensive check: ensure url is valid http (should already be filtered)
     # This is safety net, primary filtering happens earlier
     try:
         from yt_clipper.core.playlist_utils import is_video_entry_available
-    except ImportError:
+    except ImportError as exc:
+        logger.debug("Falling back to legacy utils.is_video_entry_available: %s",
+                     describe_failure(exc))
         from yt_clipper.core.utils import is_video_entry_available
     try:
         # If someone passes a dict-like unavailable entry as url (should not happen),
@@ -485,9 +576,15 @@ def download_clip(
             if not isinstance(url, str) or not url.startswith("http"):
                 raise ValueError(f"Invalid download URL: {url}")
     except ValueError:
+        # A genuinely invalid target: this is the operation's FAILURE outcome
+        # (§7), so it propagates to the caller that reports it.
         raise
-    except Exception:
-        pass
+    except Exception as exc:
+        # The safety net itself broke (e.g. an entry shape it cannot inspect).
+        # Fail open - the primary filtering already ran - but stay observable
+        # instead of hiding a broken guard (§4, §21).
+        logger.warning("Download URL safety check could not run; continuing: %s",
+                       describe_failure(exc))
 
     if audio_only:
         base, _extension = os.path.splitext(output_path)
@@ -515,7 +612,9 @@ def download_clip(
                 "attempt": attempt,
                 "max_attempts": max_attempts,
                 "delay": delay,
-                "error": str(exc),
+                # Redacted: this text is displayed to the user, and yt-dlp
+                # messages can embed signed media URLs (§16, §18).
+                "error": safe_message(exc),
             })
 
     def _attempt():
@@ -524,6 +623,12 @@ def download_clip(
                 info = ydl.extract_info(url, download=False)
             except yt_dlp.utils.DownloadError as exc:
                 if format_id and not _is_transient_error(exc):
+                    # Translated into an actionable message for the user; the
+                    # reason is recorded because the raw text alone is cryptic.
+                    logger.warning(
+                        "Requested format_id %r is not usable for %s: %s",
+                        format_id, redact_secrets(url), safe_message(exc),
+                    )
                     raise ValueError(
                         f"format_id {format_id!r} is not available for this video "
                         f"(it may be video-only and need an audio format merged "
@@ -581,6 +686,7 @@ def download_clip(
 
     _retry_call(_attempt, cancel_event=cancel_event, on_retry=_notify_retry)
 
+    logger.info("Clip written: %s", output_path)
     return output_path
 
 

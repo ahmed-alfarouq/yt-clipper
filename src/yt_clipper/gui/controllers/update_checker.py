@@ -4,6 +4,9 @@ import webbrowser
 import customtkinter as ctk
 
 from yt_clipper.core import updater
+from yt_clipper.core.log import describe_failure, get_logger
+
+logger = get_logger(__name__)
 
 CURRENT_VERSION = "1.2.0"
 UPDATE_OWNER = "ahmed-alfarouq"
@@ -28,9 +31,21 @@ class UpdateChecker:
             )
             if is_newer and latest and url:
                 self.app._post_ui_event("update_available", latest, url)
-        except Exception:
-            # Update checks are optional and must never interfere with downloads.
+        except Exception as exc:
+            # Update checks are optional and must never interfere with downloads
+            # (§13): recorded, then the worker thread ends quietly.
+            logger.debug("Update banner check failed (ignored): %s",
+                         describe_failure(exc))
             return
+
+    def _open_release(self, url):
+        """Open the release page; a failure to launch a browser is not fatal."""
+        try:
+            if not webbrowser.open(url):
+                logger.warning("No browser could open the release page %s", url)
+        except Exception as exc:
+            logger.warning("Could not open the release page %s: %s",
+                           url, describe_failure(exc))
 
     def _show_update_banner(self, latest, url):
         app = self.app
@@ -62,7 +77,7 @@ class UpdateChecker:
             text="View Release",
             width=110,
             height=28,
-            command=lambda: webbrowser.open(url),
+            command=lambda: self._open_release(url),
         ).pack(side="right", padx=(0, 10), pady=8)
         ctk.CTkButton(
             banner,

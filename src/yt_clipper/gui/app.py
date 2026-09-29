@@ -1,7 +1,6 @@
 import os
 import queue
 import threading
-import traceback
 import webbrowser
 from pathlib import Path
 
@@ -10,7 +9,10 @@ from tkinter import filedialog
 
 from yt_clipper.core import config as app_config
 from yt_clipper.core import js_runtime
+from yt_clipper.core.log import describe_failure, get_logger, safe_message
 from yt_clipper.core.utils import format_seconds, sanitize_filename
+
+logger = get_logger(__name__)
 from yt_clipper.gui.controllers import VideoLoaderController, QueueController, UpdateChecker
 from yt_clipper.gui.controllers.update_checker import CURRENT_VERSION
 from yt_clipper.gui.controllers.video_loader import THUMBNAIL_SIZE
@@ -380,15 +382,18 @@ class ClipperApp(ctk.CTk):
             try:
                 event_name, payload = self._ui_events.get_nowait()
             except queue.Empty:
+                # Queue drained: the normal way out before rescheduling.
                 break
             try:
                 self._handle_ui_event(event_name, payload)
             except Exception:
                 # A bug in one event handler must never take down all future
-                # UI updates (progress bars, queue rows, thumbnails, etc.).
-                # Print for visibility during development instead of failing
-                # silently and freezing the app.
-                traceback.print_exc()
+                # UI updates (progress bars, queue rows, thumbnails, etc.), so
+                # the loop keeps running. This is an unexpected internal failure:
+                # recorded with its traceback through logging (§18 EXCEPTION)
+                # instead of traceback.print_exc(), which wrote straight to a
+                # console the packaged windowed app does not even have.
+                logger.exception("UI event %r could not be handled", event_name)
 
         if not self._closing:
             self.after(UI_POLL_INTERVAL_MS, self._poll_ui_events)
@@ -400,6 +405,8 @@ class ClipperApp(ctk.CTk):
             self.video_loader._apply_video_thumbnail(*payload)
         elif event_name == "video_error":
             self.video_loader._apply_video_error(*payload)
+        elif event_name == "video_load_cancelled":
+            self.video_loader._apply_video_load_cancelled(*payload)
         elif event_name == "video_retry":
             self.video_loader._apply_video_retry(*payload)
         elif event_name == "playlist_metadata":
@@ -454,7 +461,12 @@ class ClipperApp(ctk.CTk):
         if self.loaded_playlist_entries is not None:
             try:
                 return len(self.loaded_playlist_entries) > 0
-            except Exception:
+            except Exception as exc:
+                # Guarded state read: an unusable collection means "nothing to
+                # download", so the button stays disabled instead of crashing.
+                logger.debug(
+                    "Playlist entry count could not be read; treating the "
+                    "playlist as empty: %s", describe_failure(exc))
                 return False
         # Single video case
         if self.loaded_url and self.video_duration is not None:
@@ -464,7 +476,10 @@ class ClipperApp(ctk.CTk):
                 if isinstance(self.video_duration, (int, float)) and not isinstance(self.video_duration, bool):
                     if math.isfinite(self.video_duration) and self.video_duration > 0:
                         return True
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "Loaded duration could not be validated; download stays "
+                    "disabled: %s", describe_failure(exc))
                 return False
         return False
 
@@ -473,19 +488,25 @@ class ClipperApp(ctk.CTk):
         try:
             can_download = self._has_valid_download_data()
             self.download_button.configure(state="normal" if can_download else "disabled")
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "Download button state could not be computed; disabling it as "
+                "the safe fallback: %s", describe_failure(exc))
             # Never crash UI due to button state update
             try:
                 self.download_button.configure(state="disabled")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Download button could not be disabled either: %s",
+                             describe_failure(exc))
 
     def set_download_enabled(self, enabled: bool):
         """Explicitly set download button enabled/disabled."""
         try:
             self.download_button.configure(state="normal" if enabled else "disabled")
-        except Exception:
-            pass
+        except Exception as exc:
+            # Presentation-only: the button keeps its previous state (§11).
+            logger.debug("Download button could not be set to %s: %s",
+                         "enabled" if enabled else "disabled", describe_failure(exc))
 
     def show_single_preview(self):
         """Show single-video preview, hide playlist preview."""
@@ -497,7 +518,10 @@ class ClipperApp(ctk.CTk):
             # Put back in its original place: after url_row, before time_range_section
             try:
                 self.info_row.pack(fill="x", padx=20, pady=(8, 8), after=self.url_row)
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "Single preview could not be anchored after the URL row; "
+                    "packing it without an anchor: %s", describe_failure(exc))
                 # Fallback if after fails (e.g., url_row not managed)
                 self.info_row.pack(fill="x", padx=20, pady=(8, 8))
         # Re-anchor time_range after current preview
@@ -514,7 +538,10 @@ class ClipperApp(ctk.CTk):
         if not self.playlist_preview.winfo_manager():
             try:
                 self.playlist_preview.pack(fill="x", padx=20, pady=(8, 8), after=self.url_row)
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "Playlist preview could not be anchored after the URL row; "
+                    "packing it without an anchor: %s", describe_failure(exc))
                 self.playlist_preview.pack(fill="x", padx=20, pady=(8, 8))
         # Re-anchor time_range after current preview
         if self.time_range_section.winfo_manager():
@@ -582,7 +609,11 @@ class ClipperApp(ctk.CTk):
                 # Guard against empty / "None" / "undefined" after sanitization
                 if safe_stem and safe_stem.lower() not in ("none", "undefined"):
                     initial_file = f"{safe_stem}{extension}"
-        except Exception:
+        except Exception as exc:
+            # Optional convenience (§11): without a suggested name the dialog
+            # simply opens with no initial filename.
+            logger.debug("Suggested output filename could not be built: %s",
+                         describe_failure(exc))
             initial_file = None
 
         if initial_file:
@@ -605,7 +636,13 @@ class ClipperApp(ctk.CTk):
         self.output_entry.delete(0, "end")
         self.output_entry.insert(0, str(normalized))
         self.app_config["last_output_dir"] = str(normalized.parent)
-        app_config.save_config(self.app_config)
+        if app_config.save_config(self.app_config) is False:
+            # §15: persisting settings is optional. The chosen path is still
+            # used for this run, so tell the user instead of failing quietly.
+            self.set_status(
+                "Settings could not be saved; they apply to this session only.",
+                "#e6a817",
+            )
 
     # ---------- Time synchronization ----------
 

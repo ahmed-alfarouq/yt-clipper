@@ -8,10 +8,16 @@ import customtkinter as ctk
 from tkinter import messagebox
 
 from yt_clipper.core import config as app_config
+from yt_clipper.core.log import describe_failure, get_logger
 from yt_clipper.core.utils import format_seconds, sanitize_filename
+
+logger = get_logger(__name__)
+
 try:
     from yt_clipper.core.playlist_utils import filter_available_videos
-except ImportError:
+except ImportError as _import_exc:  # legacy layout fallback (§20: kept observable)
+    logger.debug("Falling back to legacy utils.filter_available_videos: %s",
+                 describe_failure(_import_exc))
     from yt_clipper.core.utils import filter_available_videos
 from yt_clipper.gui.models import DownloadJob
 
@@ -58,6 +64,10 @@ class QueueController:
         try:
             requested_path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
+            # Nothing was queued, so this is a clean refusal rather than a
+            # failed job: the user is told why and can pick another folder.
+            logger.warning("Output folder %s could not be created; nothing queued: %s",
+                           requested_path.parent, describe_failure(exc))
             messagebox.showerror(
                 "Invalid output folder",
                 f"The output folder could not be created:\n{exc}",
@@ -68,7 +78,14 @@ class QueueController:
             # Shared validated dataset – already filtered, but defensive check
             try:
                 validated = filter_available_videos(app.loaded_playlist_entries)
-            except Exception:
+            except Exception as exc:
+                # Fail open (§4): the shared dataset was already validated at
+                # load time, so a broken re-check must not empty the queue.
+                logger.warning(
+                    "Defensive playlist filter failed before queueing; using the "
+                    "%d already validated entries: %s",
+                    len(app.loaded_playlist_entries), describe_failure(exc),
+                )
                 validated = app.loaded_playlist_entries
             self._enqueue_playlist(validated, audio_only, requested_path)
             self.reset_fields()
@@ -122,8 +139,22 @@ class QueueController:
             app.set_status(f"Starting download: {output_path.name}", "#4da6ff")
 
         app.app_config["last_output_dir"] = str(output_path.parent)
-        app_config.save_config(app.app_config)
+        self._remember_output_dir(app, output_path.parent)
         self.reset_fields()
+
+    @staticmethod
+    def _remember_output_dir(app, directory):
+        """Persist the last output folder; a failure here is never fatal (§15).
+
+        save_config already logs the reason at WARNING, so the UI only needs to
+        say that the preference was not remembered - the queued downloads are
+        unaffected either way.
+        """
+        if app_config.save_config(app.app_config) is False:
+            app.set_status(
+                "Settings could not be saved; they apply to this session only.",
+                "#e6a817",
+            )
 
     def _enqueue_playlist(self, entries, audio_only, requested_path):
         """Queue one job per playlist video, each downloaded in full.
@@ -138,7 +169,13 @@ class QueueController:
         # Defensive check – primary filtering already happened earlier
         try:
             validated_entries = filter_available_videos(entries)
-        except Exception:
+        except Exception as exc:
+            # Fail open (§4): dropping every video because a safety-net filter
+            # raised would silently turn a valid playlist into an empty queue.
+            logger.warning(
+                "Defensive playlist filter failed while queueing; using the %d "
+                "entries as given: %s", len(entries), describe_failure(exc),
+            )
             validated_entries = entries
 
         queued_count = 0
@@ -164,7 +201,7 @@ class QueueController:
 
         self.render_queue()
         app.app_config["last_output_dir"] = str(directory)
-        app_config.save_config(app.app_config)
+        self._remember_output_dir(app, directory)
         app.set_status(f"Queued {queued_count} full videos from playlist", "#4da6ff")
 
     def _unique_output_path(self, requested_path):
@@ -424,25 +461,32 @@ class QueueController:
             if job in app.queue_jobs:
                 app.queue_jobs.remove(job)
         except ValueError:
+            # The row was already removed (e.g. cancelled while pending); the
+            # desired end state - no row for this job - is already true.
             pass
         if app._active_job_id == job_id:
             app._active_job_id = None
             try:
                 app.progress.set(0)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Progress bar could not be reset after cancel: %s",
+                             describe_failure(exc))
         try:
             app._queue_status_labels.pop(job_id, None)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Stale status label for job %s could not be dropped: %s",
+                         job_id, describe_failure(exc))
         self.render_queue()
         try:
             if output_name:
                 app.set_status(f"Cancelled: {output_name} removed", "gray")
             else:
                 app.set_status("Download cancelled", "gray")
-        except Exception:
-            pass
+        except Exception as exc:
+            # The cancellation itself already happened; only the status text
+            # failed, so this stays a presentation-level note (§16).
+            logger.debug("Cancellation status text could not be shown: %s",
+                         describe_failure(exc))
 
     def _queue_idle(self):
         app = self.app
@@ -470,16 +514,25 @@ class QueueController:
 
     @staticmethod
     def _open_containing_folder(file_path):
+        """Open the folder holding a finished download.
+
+        §11: a convenience that must never undo a successful download. Failure
+        (no file manager, headless session, sandbox) is recorded at WARNING so
+        "the folder did not open" is explainable, and the job stays Done.
+        """
         folder = os.path.dirname(os.path.abspath(file_path))
         try:
             if sys.platform == "win32":
                 os.startfile(folder)
-            elif sys.platform == "darwin":
-                subprocess.run(["open", folder], check=False)
-            else:
-                subprocess.run(["xdg-open", folder], check=False)
-        except Exception:
-            pass
+                return
+            opener = "open" if sys.platform == "darwin" else "xdg-open"
+            result = subprocess.run([opener, folder], check=False)
+            if result.returncode != 0:
+                logger.warning("%s could not open %s (exit %s); the download itself "
+                               "succeeded", opener, folder, result.returncode)
+        except Exception as exc:
+            logger.warning("Containing folder %s could not be opened; the download "
+                           "itself succeeded: %s", folder, describe_failure(exc))
 
     def reset_fields(self):
         app = self.app
@@ -492,21 +545,25 @@ class QueueController:
         app.video_loader._set_thumbnail(None, False)
         try:
             app.playlist_preview.clear()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Playlist preview could not be cleared on reset: %s",
+                         describe_failure(exc))
         try:
             app.show_single_preview()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Single preview could not be restored on reset: %s",
+                         describe_failure(exc))
         try:
             app.video_info_label.configure(
                 text="No video loaded yet",
                 text_color="gray",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Video info label could not be reset: %s",
+                         describe_failure(exc))
         try:
             app.set_download_enabled(False)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Download button could not be disabled on reset: %s",
+                         describe_failure(exc))
         app.set_time_range_visible(True)

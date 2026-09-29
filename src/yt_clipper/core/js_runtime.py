@@ -23,6 +23,10 @@ import shutil
 import sys
 from pathlib import Path
 
+from yt_clipper.core.log import describe_failure, get_logger
+
+logger = get_logger(__name__)
+
 # In recommendation order per the EJS wiki - matches what yt-dlp itself
 # looks for by default (only "deno" is enabled by default upstream; the
 # others still count here since they mean the user solved this another way).
@@ -34,22 +38,33 @@ DENO_INSTALL_URL = "https://github.com/denoland/deno/releases"
 
 def ensure_bundled_runtime_on_path():
     """Prepend a `runtimes/` folder next to the app/exe to PATH, if present."""
-    if getattr(sys, "frozen", False):
-        base_dir = Path(sys.executable).parent
-    else:
-        # .../src/yt_clipper/core/js_runtime.py -> project root
-        base_dir = Path(__file__).resolve().parents[3]
+    try:
+        if getattr(sys, "frozen", False):
+            base_dir = Path(sys.executable).parent
+        else:
+            # .../src/yt_clipper/core/js_runtime.py -> project root
+            base_dir = Path(__file__).resolve().parents[3]
 
-    runtimes_dir = base_dir / "runtimes"
-    if runtimes_dir.is_dir():
-        os.environ["PATH"] = str(runtimes_dir) + os.pathsep + os.environ.get("PATH", "")
+        runtimes_dir = base_dir / "runtimes"
+        if runtimes_dir.is_dir():
+            os.environ["PATH"] = str(runtimes_dir) + os.pathsep + os.environ.get("PATH", "")
+    except Exception as exc:
+        # Optional convenience: a bundled runtime we cannot expose must not
+        # stop the app from starting or a download from running (§14).
+        logger.warning("Could not add a bundled JS runtime folder to PATH: %s",
+                       describe_failure(exc))
 
 
 def find_available_runtime():
     """Return the name of the first known JS runtime found on PATH, else None."""
     for name in KNOWN_RUNTIME_EXECUTABLES:
-        if shutil.which(name):
-            return name
+        try:
+            if shutil.which(name):
+                return name
+        except Exception as exc:
+            # Detection is best-effort; one unusable PATH entry must not abort
+            # the search for the remaining runtimes (§14).
+            logger.debug("JS runtime probe for %r failed: %s", name, describe_failure(exc))
     return None
 
 

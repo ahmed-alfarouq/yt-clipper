@@ -10,14 +10,21 @@ import customtkinter as ctk
 try:
     from PIL import Image
 except ImportError:
+    # Pillow is optional (§11): rows render without thumbnails.
     Image = None  # type: ignore
+
+from yt_clipper.core.log import describe_failure, get_logger
+
+logger = get_logger(__name__)
 
 try:
     from yt_clipper.core.playlist_utils import (
         format_publish_date,
         sort_videos_by_publish_date,
     )
-except ImportError:
+except ImportError as _import_exc:  # legacy layout fallback (§20: kept observable)
+    logger.debug("Falling back to legacy utils date helpers: %s",
+                 describe_failure(_import_exc))
     from yt_clipper.core.utils import (
         format_publish_date,
         sort_videos_by_publish_date,
@@ -90,8 +97,16 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
         # Defensive copy + sort (does not mutate original)
         try:
             sorted_videos = sort_videos_by_publish_date(videos or [])
-        except Exception:
-            # If sorting fails for any reason, fall back to original order
+        except Exception as exc:
+            # If sorting fails for any reason, fall back to original order.
+            # Every video is still shown, so this is recoverable - but it is
+            # logged because the preview then no longer matches the advertised
+            # "oldest first" ordering (§12, §21).
+            logger.warning(
+                "Playlist preview could not be sorted by publish date; showing "
+                "the %d videos in their original order: %s",
+                len(videos or []), describe_failure(exc),
+            )
             sorted_videos = list(videos or [])
 
         self._videos = sorted_videos
@@ -155,8 +170,9 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
         if self._empty_label is not None:
             try:
                 self._empty_label.destroy()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Empty-state label could not be destroyed: %s",
+                             describe_failure(exc))
             self._empty_label = None
 
     def _create_video_item(self, video: Dict[str, Any], index: int, request_id: int):
@@ -245,14 +261,17 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
             def _on_enter(e, frame=item_frame):
                 try:
                     frame.configure(fg_color="gray24")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Hover highlight is pure decoration (§11).
+                    logger.debug("Hover highlight could not be applied: %s",
+                                 describe_failure(exc))
 
             def _on_leave(e, frame=item_frame):
                 try:
                     frame.configure(fg_color="gray20")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Hover highlight could not be removed: %s",
+                                 describe_failure(exc))
 
             for widget in (item_frame, thumb_label, text_frame, title_label, date_label):
                 widget.bind("<Enter>", _on_enter)
@@ -297,23 +316,32 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
                     label.configure(image=ctk_img, text="")
                     self._thumbnail_images_refs.append(ctk_img)
                     self._thumbnail_cache[thumbnail_url] = ctk_img
-                except Exception:
-                    # Thumbnail display failure should not crash app
+                except Exception as exc:
+                    # Thumbnail display failure should not crash app (§11): the
+                    # row keeps its text and shows the "unavailable" glyph.
+                    logger.debug("Playlist thumbnail could not be displayed: %s",
+                                 describe_failure(exc))
                     try:
                         label.configure(text="⚠", image=None)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Thumbnail placeholder could not be shown: %s",
+                                     describe_failure(exc))
                     self._thumbnail_cache[thumbnail_url] = None
 
             # Use after to run on main thread
             try:
                 label.after(0, _update)
-            except Exception:
-                # If after fails (widget destroyed), ignore
-                pass
+            except Exception as exc:
+                # If after fails (widget destroyed), ignore: the row is gone, so
+                # there is nothing left to update (§11).
+                logger.debug("Thumbnail update could not be scheduled; the row is "
+                             "probably gone: %s", describe_failure(exc))
 
-        except Exception:
-            # Cache failure to avoid repeated attempts
+        except Exception as exc:
+            # Decorative fetch: cached as failed so it is not retried, and the
+            # row still shows its title/date (§11).
+            logger.debug("Playlist thumbnail could not be fetched: %s",
+                         describe_failure(exc))
             self._thumbnail_cache[thumbnail_url] = None
 
             def _fail_update():
@@ -322,13 +350,15 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
                 try:
                     if label.winfo_exists():
                         label.configure(text="⚠", image=None)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Thumbnail failure placeholder could not be shown: %s",
+                                 describe_failure(exc))
 
             try:
                 label.after(0, _fail_update)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Thumbnail failure notice could not be scheduled: %s",
+                             describe_failure(exc))
 
     @staticmethod
     def _open_url(url: str):
@@ -337,7 +367,11 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
         if not url.startswith("http"):
             return
         try:
-            webbrowser.open(url)
-        except Exception:
-            # Opening browser is best-effort, never crash app
-            pass
+            if not webbrowser.open(url):
+                # Nothing happened after an explicit click: recoverable, but it
+                # must not be silent (§11, §18).
+                logger.warning("No browser could open %s", url)
+        except Exception as exc:
+            # Opening browser is best-effort, never crash app.
+            logger.warning("Could not open %s in a browser: %s",
+                           url, describe_failure(exc))

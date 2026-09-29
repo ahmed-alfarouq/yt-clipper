@@ -11,10 +11,22 @@ from tkinter import messagebox
 try:
     from PIL import Image
 except ImportError:
+    # Pillow is optional: without it every thumbnail reports failed=True and the
+    # UI shows its placeholder. Loading and clipping are unaffected (§11).
     Image = None
 
 from yt_clipper.core import downloader
+from yt_clipper.core.errors import DownloadCancelled
+from yt_clipper.core.log import (
+    describe_failure,
+    get_logger,
+    redact_secrets,
+    safe_message,
+)
 from yt_clipper.core.utils import format_seconds, sanitize_filename
+
+logger = get_logger(__name__)
+
 # Playlist utilities are in focused module; fallback to utils for backward compat
 try:
     from yt_clipper.core.playlist_utils import (
@@ -22,7 +34,9 @@ try:
         filter_available_videos,
         detect_youtube_url_type,
     )
-except ImportError:
+except ImportError as _import_exc:  # legacy layout fallback (§20: kept observable)
+    logger.debug("Falling back to legacy core.utils playlist helpers: %s",
+                 describe_failure(_import_exc))
     from yt_clipper.core.utils import (
         sort_videos_by_publish_date,
         filter_available_videos,
@@ -66,16 +80,16 @@ class VideoLoaderController:
         app.load_btn.configure(state="disabled", text="Loading...")
         try:
             app.set_download_enabled(False)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Download button could not be disabled while loading: %s", describe_failure(exc))
 
         url_type = detect_youtube_url_type(url)
         try:
             if url_type == "playlist":
                 try:
                     app.show_playlist_preview()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Playlist preview could not be shown before loading: %s", describe_failure(exc))
                 app.playlist_preview.show_loading("Connecting to YouTube... Reading playlist details...")
                 app.video_info_label.configure(
                     text="Connecting to YouTube...\nReading playlist details...",
@@ -84,15 +98,15 @@ class VideoLoaderController:
             else:
                 try:
                     app.show_single_preview()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Single-video preview could not be shown before loading: %s", describe_failure(exc))
                 app.video_info_label.configure(
                     text="Connecting to YouTube...\nReading video details; this may take a few seconds.",
                     text_color="#4da6ff",
                 )
                 app.playlist_preview.show_loading("Connecting to YouTube... Reading video details...")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Loading placeholder could not be displayed: %s", describe_failure(exc))
 
         app.set_status("Loading video information...", "#4da6ff")
         self._show_load_progress()
@@ -104,11 +118,19 @@ class VideoLoaderController:
         ).start()
 
     def _load_video_worker(self, request_id, url):
+        """Background half of "Load Video".
+
+        Terminal outcomes (§2, §16): a resolved video/playlist posts metadata,
+        an empty-but-valid playlist posts metadata with no entries, a failure
+        posts `video_error` with a human-readable message, and a cancellation
+        posts `video_load_cancelled` - never an error (§3).
+        """
         app = self.app
         try:
             def _notify_retry(attempt, max_attempts, delay, exc):
                 app._post_ui_event(
-                    "video_retry", request_id, attempt, max_attempts, delay, str(exc)
+                    "video_retry", request_id, attempt, max_attempts, delay,
+                    safe_message(exc),
                 )
 
             result = downloader.expand_playlist(url, on_retry=_notify_retry)
@@ -119,7 +141,15 @@ class VideoLoaderController:
                 # but filter again at shared data boundary for safety
                 try:
                     available = filter_available_videos(entries)
-                except Exception:
+                except Exception as exc:
+                    # Fail open (§4): a broken second filter must not discard an
+                    # already validated playlist, and must not be silent.
+                    logger.warning(
+                        "Secondary playlist filter failed while loading %s; keeping "
+                        "the %d entries from the downloader: %s",
+                        redact_secrets(url), len(entries),
+                        describe_failure(exc),
+                    )
                     available = entries
 
                 app._post_ui_event(
@@ -153,15 +183,37 @@ class VideoLoaderController:
                 entry,
             )
 
-            thumbnail, thumbnail_failed = self._fetch_thumbnail(entry.get("thumbnail"))
+            try:
+                thumbnail, thumbnail_failed = self._fetch_thumbnail(
+                    entry.get("thumbnail")
+                )
+            except Exception as thumb_exc:
+                # §11: the video itself loaded successfully, so an unexpected
+                # thumbnail problem must not be reported as a failed load. The
+                # UI still learns the thumbnail is missing (failed=True).
+                logger.warning(
+                    "Thumbnail step failed after a successful load of %s; "
+                    "continuing without a thumbnail: %s",
+                    redact_secrets(url), describe_failure(thumb_exc),
+                )
+                thumbnail, thumbnail_failed = None, True
             app._post_ui_event(
                 "video_thumbnail",
                 request_id,
                 thumbnail,
                 thumbnail_failed,
             )
+        except DownloadCancelled:
+            # Cancellation is its own outcome: reported as cancelled, never as a
+            # failure, and no further work is started for this request (§3).
+            logger.info("Video load cancelled: %s", redact_secrets(url))
+            app._post_ui_event("video_load_cancelled", request_id)
         except Exception as exc:
-            app._post_ui_event("video_error", request_id, str(exc))
+            # The load failed: one ERROR record for diagnosis, and a redacted,
+            # traceback-free message for the user (§16, §18).
+            logger.error("Video load failed for %s: %s",
+                         redact_secrets(url), describe_failure(exc))
+            app._post_ui_event("video_error", request_id, safe_message(exc))
 
     @staticmethod
     def _fetch_thumbnail(thumbnail_url):
@@ -178,14 +230,20 @@ class VideoLoaderController:
             image.thumbnail(THUMBNAIL_SIZE)
             image.load()
             return image, False
-        except Exception:
+        except Exception as exc:
+            # §11: a thumbnail is decorative. The failure is recoverable and
+            # non-fatal - the caller reports "Thumbnail unavailable" in the UI,
+            # so the log only needs the detail a developer would want.
+            logger.debug("Thumbnail could not be fetched or decoded: %s",
+                         describe_failure(exc))
             return None, True
 
     def _show_load_progress(self):
         app = self.app
         try:
             anchor = app._get_current_preview_anchor()
-        except Exception:
+        except Exception as exc:
+            logger.debug("Progress bar anchor could not be resolved; using the fallback widget: %s", describe_failure(exc))
             anchor = getattr(app, 'playlist_preview', None) or app.info_row
         if not app.load_progress.winfo_manager():
             app.load_progress.pack(
@@ -207,8 +265,8 @@ class VideoLoaderController:
             return
         try:
             app.set_download_enabled(False)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Download button could not be disabled while retrying: %s", describe_failure(exc))
         try:
             app.video_info_label.configure(
                 text=(
@@ -217,8 +275,8 @@ class VideoLoaderController:
                 ),
                 text_color="#e6a817",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Retry notice could not be shown in the video info label: %s", describe_failure(exc))
         try:
             if hasattr(app, 'playlist_preview') and app.playlist_preview.winfo_manager():
                 app.playlist_preview.show_loading(
@@ -228,8 +286,8 @@ class VideoLoaderController:
                 app.playlist_preview.show_loading(
                     f"⚠ Network hiccup, retrying ({attempt}/{max_attempts}) in {delay:.0f}s..."
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Retry notice could not be shown in the playlist preview: %s", describe_failure(exc))
         app.set_status(f"Retrying video load ({attempt}/{max_attempts})...", "#e6a817")
 
     def _apply_playlist_metadata(self, request_id, url, playlist_title, entries):
@@ -253,13 +311,27 @@ class VideoLoaderController:
         # CRITICAL: Filter at shared data boundary before sorting and before storing
         try:
             available_entries = filter_available_videos(entries)
-        except Exception:
+        except Exception as exc:
+            # Fail open (§4): the downloader already validated these entries, so
+            # a broken re-filter must not empty the user's playlist.
+            logger.warning(
+                "Playlist filter failed while applying metadata; keeping all %d "
+                "entries: %s", len(entries), describe_failure(exc),
+            )
             available_entries = list(entries)
 
         # Sort oldest→newest, missing dates at end (missing date != unavailable)
         try:
             sorted_entries = sort_videos_by_publish_date(available_entries)
-        except Exception:
+        except Exception as exc:
+            # Sorting is presentation-only, so the playlist is kept in the
+            # downloader's order; the broken promise ("oldest first") is logged
+            # because the UI text still claims the ordering (§12, §21).
+            logger.warning(
+                "Playlist could not be sorted by publish date; keeping the "
+                "original order of %d entries: %s",
+                len(available_entries), describe_failure(exc),
+            )
             sorted_entries = list(available_entries)
 
         # Shared application state – validated dataset used by both preview and download
@@ -274,8 +346,8 @@ class VideoLoaderController:
 
         try:
             app.show_playlist_preview()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Playlist preview could not be shown for the loaded playlist: %s", describe_failure(exc))
 
         try:
             if not sorted_entries:
@@ -296,8 +368,8 @@ class VideoLoaderController:
                     ),
                     text_color="#4caf50",
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Playlist summary could not be shown in the video info label: %s", describe_failure(exc))
 
         # Playlist preview receives VALIDATED data, no own availability logic
         try:
@@ -308,18 +380,19 @@ class VideoLoaderController:
                 )
             else:
                 app.playlist_preview.set_videos(sorted_entries)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Playlist preview rows could not be rendered: %s", describe_failure(exc))
 
         app.load_btn.configure(state="normal", text="Load Video")
         self._hide_load_progress()
         try:
             app.update_download_button_state()
-        except Exception:
+        except Exception as exc:
+            logger.debug("Download button state could not be refreshed after loading a playlist: %s", describe_failure(exc))
             try:
                 app.set_download_enabled(bool(sorted_entries))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Download button could not be re-enabled from the fallback path: %s", describe_failure(exc))
 
         if not sorted_entries:
             app.set_status(
@@ -351,8 +424,8 @@ class VideoLoaderController:
                 ),
                 text_color="#4caf50",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Playlist thumbnail note could not be shown in the video info label: %s", describe_failure(exc))
 
     def _apply_video_metadata(self, request_id, url, title, duration, entry=None):
         app = self.app
@@ -375,8 +448,8 @@ class VideoLoaderController:
 
         try:
             app.show_single_preview()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Single-video preview could not be shown for the loaded video: %s", describe_failure(exc))
 
         try:
             app.video_info_label.configure(
@@ -387,24 +460,25 @@ class VideoLoaderController:
                 ),
                 text_color="#4da6ff",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Video details could not be shown in the video info label: %s", describe_failure(exc))
         app.update_clip_length()
 
         try:
             app.playlist_preview.clear()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Playlist preview could not be cleared for a single video: %s", describe_failure(exc))
 
         app.load_btn.configure(state="normal", text="Load Video")
         self._hide_load_progress()
         try:
             app.update_download_button_state()
-        except Exception:
+        except Exception as exc:
+            logger.debug("Download button state could not be refreshed after loading a video: %s", describe_failure(exc))
             try:
                 app.set_download_enabled(True)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Download button could not be re-enabled from the fallback path: %s", describe_failure(exc))
         app.set_status("Video loaded. Fetching thumbnail...", "#4da6ff")
 
     def _apply_suggested_filename(self, title):
@@ -437,15 +511,15 @@ class VideoLoaderController:
                 ),
                 text_color="#4caf50",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Video details could not be refreshed after the thumbnail step: %s", describe_failure(exc))
 
         app.load_btn.configure(state="normal", text="Load Video")
         self._hide_load_progress()
         try:
             app.update_download_button_state()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Download button state could not be refreshed after the thumbnail step: %s", describe_failure(exc))
         app.set_status("Video loaded. Choose a time range and add it to the queue.", "#4caf50")
 
     def _apply_video_error(self, request_id, error_message):
@@ -463,27 +537,71 @@ class VideoLoaderController:
 
         try:
             app.show_single_preview()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Single-video preview could not be shown for a failed load: %s", describe_failure(exc))
 
         try:
             app.video_info_label.configure(
                 text=f"❌ Couldn't load video: {error_message}",
                 text_color="#e05252",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failure message could not be shown in the video info label: %s", describe_failure(exc))
         try:
             app.playlist_preview.clear()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Playlist preview could not be cleared after a failed load: %s", describe_failure(exc))
 
         app.load_btn.configure(state="normal", text="Load Video")
         try:
             app.set_download_enabled(False)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Download button could not be disabled after a failed load: %s", describe_failure(exc))
         app.set_status("Video information could not be loaded.", "#e05252")
+
+    def _apply_video_load_cancelled(self, request_id):
+        """Restore the UI after a cancelled video load.
+
+        §3/§16: cancellation is its own terminal state. The UI shows "Cancelled"
+        in the neutral grey used elsewhere for cancels - never the red failure
+        styling and never an error message - and no further work is started for
+        the cancelled request.
+        """
+        app = self.app
+        if request_id != app._load_request_id:
+            # A newer load already replaced this one; touching the UI now would
+            # report the old request's outcome over the new one.
+            logger.debug("Ignoring cancellation of stale load request %s", request_id)
+            return
+
+        app.video_duration = None
+        app.loaded_url = None
+        app.loaded_title = None
+        app.loaded_playlist_entries = None
+        self._set_thumbnail(None, False)
+        self._hide_load_progress()
+
+        try:
+            app.video_info_label.configure(
+                text="⏹ Loading cancelled",
+                text_color="gray",
+            )
+        except Exception as exc:
+            logger.debug("Cancellation notice could not be shown in the video info "
+                         "label: %s", describe_failure(exc))
+        try:
+            app.playlist_preview.clear()
+        except Exception as exc:
+            logger.debug("Playlist preview could not be cleared after a cancelled "
+                         "load: %s", describe_failure(exc))
+
+        app.load_btn.configure(state="normal", text="Load Video")
+        try:
+            app.set_download_enabled(False)
+        except Exception as exc:
+            logger.debug("Download button could not be disabled after a cancelled "
+                         "load: %s", describe_failure(exc))
+        app.set_status("Loading cancelled.", "gray")
 
     def _set_thumbnail(self, image, failed):
         app = self.app
@@ -500,5 +618,6 @@ class VideoLoaderController:
             )
             app.thumbnail_label.configure(image=ctk_image, text="")
             app._thumbnail_image = ctk_image
-        except Exception:
+        except Exception as exc:
+            logger.debug("Thumbnail could not be displayed; clearing the previous image: %s", describe_failure(exc))
             app._thumbnail_image = None

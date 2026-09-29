@@ -43,6 +43,8 @@ class TimeInput(ctk.CTkFrame):
         try:
             val = int(var.get())
         except ValueError:
+            # Half-typed user input ("1a", "") is an expected condition, not a
+            # failure (§18): the stepper restarts from 0 and keeps working.
             val = 0
         val = max(0, val + delta)
         if not uncapped:
@@ -54,6 +56,8 @@ class TimeInput(ctk.CTkFrame):
         try:
             val = int(var.get())
         except ValueError:
+            # Same as _step: unparsable text normalises to 0 rather than
+            # aborting focus-out handling (§18).
             val = 0
         val = max(0, val) if uncapped else max(0, min(val, 59))
         var.set(f"{val:02d}")
@@ -68,6 +72,9 @@ class TimeInput(ctk.CTkFrame):
             h, m, s = int(self.h_var.get() or 0), int(self.m_var.get() or 0), int(self.s_var.get() or 0)
             return h * 3600 + m * 60 + s
         except ValueError:
+            # Unparsable field text reads as 0 seconds; the caller (queue
+            # controller) still validates end > start before queueing, so an
+            # invalid range cannot be mistaken for a valid one (§18, §21).
             return 0
 
     def set_seconds(self, total_seconds):
