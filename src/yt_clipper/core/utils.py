@@ -10,11 +10,12 @@ import os
 import sys
 import subprocess
 
-_WINDOWS_INVALID_CHARS_RE = re.compile(r'[<>:\"/\\|?*\x00-\\x1f]')
+_WINDOWS_INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
+    "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³",
 }
 
 def _utf16_len(s):
