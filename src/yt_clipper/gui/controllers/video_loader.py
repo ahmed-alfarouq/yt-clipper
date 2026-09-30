@@ -52,11 +52,13 @@ class VideoLoaderController:
     Critical flow for playlists (must never let raw entries reach UI/download):
       YouTube URL
           ↓
-      downloader.expand_playlist()  -> already filters hidden/unavailable at extraction boundary
+      downloader.expand_playlist()  -> the canonical availability decision,
+                                       applied at the extraction boundary
           ↓
-      RAW entries (already filtered in downloader)
+      validated entries
           ↓
-      filter_available_videos() again for safety (shared boundary)
+      _apply_playlist_metadata()    -> filter_available_videos() applied once, at
+                                       the shared-state boundary (fail-open, §4)
           ↓
       sort_videos_by_publish_date()
           ↓
@@ -136,28 +138,18 @@ class VideoLoaderController:
             result = downloader.expand_playlist(url, on_retry=_notify_retry)
 
             if result["is_playlist"]:
-                entries = result["entries"]
-                # Downloader already filtered at extraction boundary,
-                # but filter again at shared data boundary for safety
-                try:
-                    available = filter_available_videos(entries)
-                except Exception as exc:
-                    # Fail open (§4): a broken second filter must not discard an
-                    # already validated playlist, and must not be silent.
-                    logger.warning(
-                        "Secondary playlist filter failed while loading %s; keeping "
-                        "the %d entries from the downloader: %s",
-                        redact_secrets(url), len(entries),
-                        describe_failure(exc),
-                    )
-                    available = entries
-
+                # The downloader applied the canonical decision at the extraction
+                # boundary, and _apply_playlist_metadata applies it at the
+                # shared-state boundary it guards - the one that feeds both the
+                # preview and the queue. Filtering here too would run the same
+                # list through the same decision twice with nothing in between
+                # that could change the answer.
                 app._post_ui_event(
                     "playlist_metadata",
                     request_id,
                     url,
                     result.get("playlist_title") or "Playlist",
-                    available,
+                    result["entries"],
                 )
                 return
 
@@ -294,9 +286,11 @@ class VideoLoaderController:
         """Apply playlist metadata – filtering MUST happen before sorting and state.
 
         Flow:
-          raw entries (already filtered in downloader)
+          validated entries (the canonical decision was applied at the
+          extraction boundary)
               ↓
-          filter_available_videos() at shared boundary
+          filter_available_videos() - this boundary's single application, before
+          sorting and before shared state (fail-open, §4)
               ↓
           sort_videos_by_publish_date()
               ↓

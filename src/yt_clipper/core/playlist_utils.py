@@ -7,9 +7,14 @@ It provides the single authoritative implementation for:
 - classify_video_entry (tri-state: available / unavailable / unknown)
 - is_video_available / is_video_entry_available
 - filter_available_videos
+- is_unavailable_error_text (explicit "this video is gone" wording in an error)
 - sort_videos_by_publish_date
 - publish-date parsing/formatting
 - YouTube URL type detection
+
+Every availability decision - from entry metadata *and* from the error text of a
+single-video full extraction - is made here, so no caller keeps a private copy
+of the marker vocabulary.
 
 Flow:
   raw yt-dlp entries
@@ -17,12 +22,20 @@ Flow:
   classify_video_entry()      <- explicit signals only
       ↓
   unavailable → dropped · available → kept · unknown → resolved by the caller
-      ↓
+      ↓                            (a full extraction of that one video, whose
+      ↓                             result is classified here again, and whose
+      ↓                             errors are read with is_unavailable_error_text)
   filter_available_videos()   <- uses is_video_entry_available()
       ↓
   sort_videos_by_publish_date()
       ↓
   shared playlist state -> Preview + Download
+
+Each boundary applies that decision once: the extraction boundary
+(downloader.expand_playlist) while it validates and normalizes raw entries, the
+GUI load boundary (video_loader) before it writes shared state, and the queue
+boundary (queue_controller) before it creates download jobs. Filtering the same
+list twice in a row adds no information, so it is not done.
 """
 
 from datetime import datetime, timezone
@@ -234,6 +247,20 @@ _UNAVAILABLE_AVAILABILITY = {
     "deleted",
 }
 
+# Wording yt-dlp/YouTube uses in a *single-video* extraction error when the video
+# is genuinely gone. This is the error-text counterpart of the entry-metadata
+# markers above; it lives here so that no caller keeps a second copy of the
+# vocabulary and "is this video unavailable?" has one answer everywhere.
+_UNAVAILABLE_ERROR_MARKERS = (
+    "private video",
+    "deleted video",
+    "video unavailable",
+    "has been removed",
+    "unavailable",
+    "removed",
+    "deleted",
+)
+
 # Presence of any of these means YouTube returned a real video object for the
 # entry. Private/deleted lockupViewModel entries omit every one of them
 # (verified from actual yt-dlp JSON, boul2gom/yt-dlp#318), so they are positive
@@ -322,6 +349,31 @@ def classify_video_entry(video: Dict[str, Any]) -> str:
 
     # No explicit signal and no positive evidence: insufficient metadata.
     return AVAILABILITY_UNKNOWN
+
+
+def is_unavailable_error_text(text: Any) -> bool:
+    """True when an extraction error explicitly says the video is gone.
+
+    The error-text half of the availability decision: a full extraction of one
+    ambiguous playlist entry answers with either metadata (classified by
+    classify_video_entry) or an error, and only explicit private/deleted/removed/
+    unavailable wording may turn that error into "filter this entry".
+
+    Anything inconclusive - geo-blocked, age-restricted, rate-limited, a network
+    failure, an HTTP status, an empty message - returns False, so the caller
+    keeps the entry and lets the download itself report a real failure. That
+    conservative fail-open is what stops a thin or unlucky playlist entry from
+    being silently discarded.
+
+    Only the message text is inspected; nothing is logged here (the caller owns
+    the outcome and its observability).
+    """
+    message = str(text or "").lower()
+    if any(marker in message for marker in _UNAVAILABLE_ERROR_MARKERS):
+        return True
+    # The two words are not always adjacent ("Private video. Sign in if you've
+    # been granted access to this video." is, but the wording varies).
+    return "private" in message and "video" in message
 
 
 def is_video_entry_available(video: Dict[str, Any]) -> bool:

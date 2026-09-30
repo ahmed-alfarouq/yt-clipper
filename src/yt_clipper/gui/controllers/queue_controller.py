@@ -39,9 +39,11 @@ class QueueController:
     reacting to job lifecycle events posted by the background worker.
 
     Playlist handling:
-      - Receives VALIDATED playlist entries from shared state (already filtered)
-      - Defensive check with filter_available_videos() as safety net
-      - Preview and Download share same validated dataset
+      - Receives validated playlist entries from shared state
+      - _enqueue_playlist() applies the canonical availability filter once, at
+        the point where download jobs are created, so no caller can turn an
+        explicitly unavailable entry into a job
+      - Preview and Download share the same validated dataset
     """
 
     def __init__(self, app):
@@ -75,19 +77,11 @@ class QueueController:
             return
 
         if app.loaded_url == url and app.loaded_playlist_entries:
-            # Shared validated dataset – already filtered, but defensive check
-            try:
-                validated = filter_available_videos(app.loaded_playlist_entries)
-            except Exception as exc:
-                # Fail open (§4): the shared dataset was already validated at
-                # load time, so a broken re-check must not empty the queue.
-                logger.warning(
-                    "Defensive playlist filter failed before queueing; using the "
-                    "%d already validated entries: %s",
-                    len(app.loaded_playlist_entries), describe_failure(exc),
-                )
-                validated = app.loaded_playlist_entries
-            self._enqueue_playlist(validated, audio_only, requested_path)
+            # Shared validated dataset. _enqueue_playlist applies the canonical
+            # availability filter where the jobs are created, so the same list is
+            # not filtered twice on the way there.
+            self._enqueue_playlist(app.loaded_playlist_entries, audio_only,
+                                   requested_path)
             self.reset_fields()
             return
 
@@ -159,14 +153,16 @@ class QueueController:
     def _enqueue_playlist(self, entries, audio_only, requested_path):
         """Queue one job per playlist video, each downloaded in full.
 
-        Entries are VALIDATED (already filtered for availability) from shared state.
-        Defensive filter as safety net against future code accidentally passing raw entries.
+        This is the queue boundary's single application of the canonical
+        availability decision: whatever list reaches job creation is filtered
+        here (fail-open, §4), so no caller - present or future - can turn an
+        explicitly unavailable entry into a download job.
         """
         app = self.app
         directory = requested_path.parent
         extension = requested_path.suffix or (".mp3" if audio_only else ".mp4")
 
-        # Defensive check – primary filtering already happened earlier
+        # Canonical filter at the job-creation gate: the only pass on this path.
         try:
             validated_entries = filter_available_videos(entries)
         except Exception as exc:

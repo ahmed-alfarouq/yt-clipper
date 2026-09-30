@@ -305,18 +305,10 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
                     single_url, cancel_event=cancel_event, on_retry=on_retry
                 )
             except yt_dlp.utils.DownloadError as exc:
-                msg = str(exc).lower()
-                # Explicit private/deleted/unavailable signals from yt-dlp.
-                if (
-                    "private video" in msg
-                    or "deleted video" in msg
-                    or "video unavailable" in msg
-                    or "has been removed" in msg
-                    or ("private" in msg and "video" in msg)
-                    or "unavailable" in msg
-                    or "removed" in msg
-                    or "deleted" in msg
-                ):
+                # Explicit private/deleted/unavailable wording is recognised by
+                # the canonical vocabulary in playlist_utils - this module no
+                # longer keeps a second copy of those markers.
+                if playlist_utils.is_unavailable_error_text(exc):
                     # Expected condition, not an error (§18): a private/deleted
                     # video is filtered out on purpose.
                     logger.info(
@@ -448,32 +440,21 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
             logger.info("Playlist %r returned no entries at all", redact_secrets(url))
             raise ValueError("This playlist has no videos, or they're all unavailable.")
 
-        # Defensive second filter using shared utility
-        try:
-            from yt_clipper.core.playlist_utils import filter_available_videos
-        except ImportError as exc:
-            logger.debug("Falling back to legacy utils.filter_available_videos: %s",
-                         describe_failure(exc))
-            from yt_clipper.core.utils import filter_available_videos
-        try:
-            entries = filter_available_videos(raw_entries)
-        except Exception as exc:
-            # Fail-open on purpose: a broken second filter must not discard an
-            # already validated playlist, and the fallback must be visible (§4).
-            logger.warning(
-                "Secondary availability filter failed; keeping the %d already "
-                "validated entries: %s", len(raw_entries), describe_failure(exc),
-            )
-            entries = raw_entries
-
+        # The loop above is this boundary's single application of the canonical
+        # decision: every entry it kept was classified AVAILABLE, or UNKNOWN and
+        # then resolved by a full extraction whose result was classified again.
+        # Re-filtering the normalized output cannot change that answer - a
+        # normalized entry always carries a URL and a title, so it classifies
+        # AVAILABLE - and running the same list through the filter twice only
+        # obscures which pass made the decision.
         logger.info(
             "Playlist %r resolved to %d downloadable video(s)",
-            info.get("title"), len(entries),
+            info.get("title"), len(raw_entries),
         )
         return {
             "is_playlist": True,
             "playlist_title": info.get("title"),
-            "entries": entries,
+            "entries": raw_entries,
         }
 
     return {
