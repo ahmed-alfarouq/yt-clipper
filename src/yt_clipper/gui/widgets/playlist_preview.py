@@ -17,18 +17,10 @@ from yt_clipper.core.log import describe_failure, get_logger
 
 logger = get_logger(__name__)
 
-try:
-    from yt_clipper.core.playlist_utils import (
-        format_publish_date,
-        sort_videos_by_publish_date,
-    )
-except ImportError as _import_exc:  # legacy layout fallback (§20: kept observable)
-    logger.debug("Falling back to legacy utils date helpers: %s",
-                 describe_failure(_import_exc))
-    from yt_clipper.core.utils import (
-        format_publish_date,
-        sort_videos_by_publish_date,
-    )
+from yt_clipper.core.playlist_utils import (
+    format_publish_date,
+    sort_videos_by_publish_date,
+)
 
 THUMBNAIL_SIZE = (120, 68)
 # Two items visible: each item ~ 84px + padding, so ~ 190px height

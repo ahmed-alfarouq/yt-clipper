@@ -278,12 +278,7 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
 
     if info.get("_type") == "playlist" or "entries" in info:
         raw_entries = []
-        try:
-            from yt_clipper.core import playlist_utils
-        except ImportError as exc:
-            logger.debug("Falling back to legacy core.utils for playlist helpers: %s",
-                         describe_failure(exc))
-            from yt_clipper.core import utils as playlist_utils
+        from yt_clipper.core import playlist_utils
 
         def _resolve_ambiguous_entry(single_url: str):
             """Resolve one flat entry whose metadata proves nothing either way.
@@ -541,12 +536,7 @@ def download_clip(
 
     # Defensive check: ensure url is valid http (should already be filtered)
     # This is safety net, primary filtering happens earlier
-    try:
-        from yt_clipper.core.playlist_utils import is_video_entry_available
-    except ImportError as exc:
-        logger.debug("Falling back to legacy utils.is_video_entry_available: %s",
-                     describe_failure(exc))
-        from yt_clipper.core.utils import is_video_entry_available
+    from yt_clipper.core.playlist_utils import is_video_entry_available
     try:
         # If someone passes a dict-like unavailable entry as url (should not happen),
         # we still guard. For normal url string, this check passes if http.

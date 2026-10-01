@@ -13,12 +13,7 @@ from yt_clipper.core.utils import format_seconds, sanitize_filename
 
 logger = get_logger(__name__)
 
-try:
-    from yt_clipper.core.playlist_utils import filter_available_videos
-except ImportError as _import_exc:  # legacy layout fallback (§20: kept observable)
-    logger.debug("Falling back to legacy utils.filter_available_videos: %s",
-                 describe_failure(_import_exc))
-    from yt_clipper.core.utils import filter_available_videos
+from yt_clipper.core.playlist_utils import filter_available_videos
 from yt_clipper.gui.models import DownloadJob
 
 STATUS_COLORS = {

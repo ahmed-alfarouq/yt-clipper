@@ -27,21 +27,14 @@ from yt_clipper.core.utils import format_seconds, sanitize_filename
 
 logger = get_logger(__name__)
 
-# Playlist utilities are in focused module; fallback to utils for backward compat
-try:
-    from yt_clipper.core.playlist_utils import (
-        sort_videos_by_publish_date,
-        filter_available_videos,
-        detect_youtube_url_type,
-    )
-except ImportError as _import_exc:  # legacy layout fallback (§20: kept observable)
-    logger.debug("Falling back to legacy core.utils playlist helpers: %s",
-                 describe_failure(_import_exc))
-    from yt_clipper.core.utils import (
-        sort_videos_by_publish_date,
-        filter_available_videos,
-        detect_youtube_url_type,
-    )
+# Playlist utilities live in their own focused module - the canonical home of
+# the availability decision (Phase 4A). It needs only the standard library and
+# core.log, so this import cannot fail in a supported installation.
+from yt_clipper.core.playlist_utils import (
+    sort_videos_by_publish_date,
+    filter_available_videos,
+    detect_youtube_url_type,
+)
 
 THUMBNAIL_SIZE = (120, 68)
 
