@@ -411,8 +411,6 @@ class ClipperApp(ctk.CTk):
             self.video_loader._apply_video_retry(*payload)
         elif event_name == "playlist_metadata":
             self.video_loader._apply_playlist_metadata(*payload)
-        elif event_name == "playlist_thumbnail":
-            self.video_loader._apply_playlist_thumbnail(*payload)
         elif event_name == "job_started":
             self.queue_controller._apply_job_started(*payload)
         elif event_name == "download_progress":

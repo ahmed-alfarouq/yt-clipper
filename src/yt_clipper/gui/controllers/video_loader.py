@@ -392,28 +392,6 @@ class VideoLoaderController:
                 "#4caf50",
             )
 
-    def _apply_playlist_thumbnail(self, request_id, thumbnail, thumbnail_failed):
-        app = self.app
-        if request_id != app._load_request_id:
-            return
-        self._set_thumbnail(thumbnail, thumbnail_failed)
-        entries = app.loaded_playlist_entries or []
-        thumbnail_note = (
-            " • Preview thumbnail unavailable" if thumbnail_failed
-            else " • Showing the first video's thumbnail"
-        )
-        try:
-            app.video_info_label.configure(
-                text=(
-                    f"📃  {app.loaded_title}\n"
-                    f"{len(entries)} videos in playlist\n"
-                    f"Each video will be downloaded in full{thumbnail_note}"
-                ),
-                text_color="#4caf50",
-            )
-        except Exception as exc:
-            logger.debug("Playlist thumbnail note could not be shown in the video info label: %s", describe_failure(exc))
-
     def _apply_video_metadata(self, request_id, url, title, duration, entry=None):
         app = self.app
         if request_id != app._load_request_id:
