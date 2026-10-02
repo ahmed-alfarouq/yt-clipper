@@ -46,54 +46,24 @@ from yt_clipper.gui.controllers import queue_controller as queue_controller_modu
 from yt_clipper.gui.controllers import video_loader as video_loader_module  # noqa: E402
 from yt_clipper.core.playlist_utils import detect_youtube_url_type  # noqa: E402
 
+# Presentation-only GUI doubles shared with the failure-contract tests. They
+# were defined here verbatim a second time; import the single definition so the
+# two suites cannot drift apart.
+from test_failure_contracts import FakeVar, Permissive, RecordingWidget  # noqa: E402
+
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLPHASE2TEST"
 VIDEO_URL = "https://www.youtube.com/watch?v=singlevideo1"
 
 
 # ---------------------------------------------------------------------------
 # Test doubles for the GUI layer
+#
+# Permissive, RecordingWidget and FakeVar are imported from
+# test_failure_contracts (identical definitions, single source of truth). The
+# doubles below are deliberately NOT shared: each records state the failure
+# contracts do not (FakeEntry.deleted, FakeTimeInput.set_calls) or exposes a
+# different queue API (this QueueHarness has no listener/payloads).
 # ---------------------------------------------------------------------------
-
-class Permissive:
-    """Presentation-only stand-in: any attribute, any call, no-op."""
-
-    def __call__(self, *args, **kwargs):
-        return Permissive()
-
-    def __getattr__(self, name):
-        if name.startswith("__"):
-            raise AttributeError(name)
-        return Permissive()
-
-
-class RecordingWidget:
-    """Records configure() calls so tests can assert on label text."""
-
-    def __init__(self):
-        self.configured = []
-        self.text = None
-
-    def configure(self, **kwargs):
-        self.configured.append(kwargs)
-        if "text" in kwargs:
-            self.text = kwargs["text"]
-
-    def __getattr__(self, name):
-        if name.startswith("__"):
-            raise AttributeError(name)
-        return lambda *args, **kwargs: None
-
-
-class FakeVar:
-    def __init__(self, value):
-        self._value = value
-
-    def get(self):
-        return self._value
-
-    def set(self, value):
-        self._value = value
-
 
 class FakeEntry:
     def __init__(self, text=""):
