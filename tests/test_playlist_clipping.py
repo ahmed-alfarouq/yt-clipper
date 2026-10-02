@@ -227,11 +227,18 @@ class GuiTestCase(unittest.TestCase):
 
     def run_playlist_download(self, app, recorder, expected_jobs):
         controller = self.make_controller(app)
+        # recorder.calls is cumulative, and a test may reuse one recorder across
+        # phases (test_10 queues a single-video clip first, then a playlist), so
+        # wait for the jobs belonging to THIS queueing. A wait on the total count
+        # is satisfied by calls recorded before it started, which releases the
+        # helper while playlist jobs are still running.
+        recorded_before = len(recorder.calls)
         with recorder.patch(), self._no_config_write():
             controller.download_clip()
             self.assertTrue(
-                wait_for(lambda: len(recorder.calls) >= expected_jobs),
-                f"only {len(recorder.calls)} of {expected_jobs} playlist jobs ran",
+                wait_for(lambda: len(recorder.calls) - recorded_before >= expected_jobs),
+                f"only {len(recorder.calls) - recorded_before} of {expected_jobs} "
+                f"playlist jobs ran",
             )
         return controller
 
@@ -490,6 +497,36 @@ class TestGuiPlaylistJobs(GuiTestCase):
         playlist_app = self.make_app(url=PLAYLIST_URL, entries=self.entries)
         self.run_playlist_download(playlist_app, recorder, 3)
         self.assertEqual(recorder.ranges, [(25, 88), (None, None), (None, None), (None, None)])
+
+    def test_10b_a_reused_recorder_waits_for_this_phase_jobs_only(self):
+        """run_playlist_download() must wait for the jobs of *this* queueing.
+
+        `DownloadCallRecorder.calls` is cumulative on purpose - test_10 asserts
+        the single-video range alongside the playlist ranges, so the earlier
+        call has to survive - which makes a wait on a *total* count release
+        early as soon as the recorder already holds a call. The per-call delay
+        turns that into a deterministic reproduction instead of a race: while
+        the third playlist job is still sleeping, a total-count wait has
+        already been satisfied by the second one.
+        """
+        recorder = DownloadCallRecorder(delay=0.05)
+
+        single = self.make_app(url=VIDEO_URL, entries=None, duration=200.0,
+                               start_seconds=25, end_seconds=88)
+        controller = self.make_controller(single)
+        with recorder.patch(), self._no_config_write():
+            controller.download_clip()
+            self.assertTrue(wait_for(lambda: len(recorder.calls) == 1))
+        before = len(recorder.calls)
+        self.assertEqual(before, 1, "the single-video phase did not record its call")
+
+        playlist_app = self.make_app(url=PLAYLIST_URL, entries=self.entries)
+        self.run_playlist_download(playlist_app, recorder, len(self.entries))
+
+        self.assertEqual(len(recorder.calls) - before, len(self.entries),
+                         "the helper returned before every job of this phase ran")
+        self.assertEqual(recorder.ranges,
+                         [(25, 88)] + [(None, None)] * len(self.entries))
 
     def test_14_queue_order_is_fifo(self):
         app = self.make_app(url=PLAYLIST_URL, entries=self.entries)
