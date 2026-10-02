@@ -23,6 +23,17 @@ FORMAT_MAP = {
     "4k": "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/best[height<=2160]",
 }
 
+# The quality tokens offered to the user, in the order both surfaces present
+# them: the CLI's -q/--quality choices and the GUI's quality dropdown. This is
+# the single definition of that list - it must stay in step with FORMAT_MAP's
+# keys, because a token offered here but unresolved there would silently
+# degrade to "best" through the FORMAT_MAP.get() default below. The order
+# differs from FORMAT_MAP's key order on purpose: this is display order.
+QUALITY_CHOICES = ("best", "4k", "1080p", "720p")
+
+# The quality used when a caller does not choose one.
+DEFAULT_QUALITY = "best"
+
 
 class _FilteredYtDlpLogger:
     """Custom yt-dlp logger that suppresses expected unavailable-video INFO messages.
@@ -516,7 +527,7 @@ def download_clip(
     start_sec,
     end_sec,
     output_path="clip.mp4",
-    quality="best",
+    quality=DEFAULT_QUALITY,
     audio_only=False,
     format_id=None,
     progress_hook=None,

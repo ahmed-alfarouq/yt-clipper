@@ -67,7 +67,8 @@ def main():
                          help="Output path for a single video. For a playlist, only "
                               "the containing folder is used; each clip is named "
                               "'NN - <video title>.<ext>'.")
-    parser.add_argument("-q", "--quality", default="best", choices=["best", "4k", "1080p", "720p"],
+    parser.add_argument("-q", "--quality", default=downloader.DEFAULT_QUALITY,
+                         choices=list(downloader.QUALITY_CHOICES),
                          help="Ignored if -f/--format-id is given.")
     parser.add_argument("-f", "--format-id",
                          help="Exact yt-dlp format selector from --list-formats, e.g. "

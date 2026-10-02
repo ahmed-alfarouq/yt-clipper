@@ -8,6 +8,7 @@ import customtkinter as ctk
 from tkinter import filedialog
 
 from yt_clipper.core import config as app_config
+from yt_clipper.core import downloader
 from yt_clipper.core import js_runtime
 from yt_clipper.core.log import describe_failure, get_logger, safe_message
 from yt_clipper.core.utils import format_seconds, sanitize_filename
@@ -236,11 +237,11 @@ class ClipperApp(ctk.CTk):
         # Quality and audio-only mode.
         quality_row = ctk.CTkFrame(card, fg_color="transparent")
         quality_row.pack(fill="x", padx=20)
-        self.quality_var = ctk.StringVar(value="best")
+        self.quality_var = ctk.StringVar(value=downloader.DEFAULT_QUALITY)
         self.quality_menu = ctk.CTkOptionMenu(
             quality_row,
             variable=self.quality_var,
-            values=["best", "4k", "1080p", "720p"],
+            values=list(downloader.QUALITY_CHOICES),
             height=40,
         )
         self.quality_menu.pack(side="left", fill="x", expand=True, padx=(0, 10))
