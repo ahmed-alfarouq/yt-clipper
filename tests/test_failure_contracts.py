@@ -11,6 +11,7 @@ runner, download recorder) and never touches the network.
 """
 
 import io
+import inspect
 import itertools
 import json
 import logging
@@ -1784,6 +1785,80 @@ class TestGuiStateContracts(ContractTestCase):
         self.assertEqual(app.video_info_label.configured[-1]["text_color"], "#e05252")
         self.assertIsNone(app.loaded_url)
         self.assertEqual(app.statuses[-1][1], "#e05252")
+
+    def test_5b_both_terminal_load_states_clear_the_same_loaded_video_state(self):
+        """A failed load and a cancelled load end in the same cleared state.
+
+        Both terminal handlers reset the loaded-video state, and that reset is
+        one shared implementation: the two outcomes differ only in the message
+        they show. This pins the invariant the shared reset exists for, so the
+        two copies cannot drift apart.
+        """
+        class RecordingProgress:
+            def __init__(self):
+                self.calls = []
+
+            def stop(self):
+                self.calls.append("stop")
+
+            def pack_forget(self):
+                self.calls.append("pack_forget")
+
+            def start(self):
+                self.calls.append("start")
+
+        def populated():
+            app = FakeLoaderApp()
+            app.video_duration = 215.0
+            app.loaded_url = VIDEO_URL
+            app.loaded_title = "Some video"
+            app.loaded_playlist_entries = [{"url": VIDEO_URL, "title": "Some video"}]
+            app._thumbnail_image = "a-previous-image"
+            app.load_progress = RecordingProgress()
+            return app
+
+        def cleared_state(app):
+            return {
+                "video_duration": app.video_duration,
+                "loaded_url": app.loaded_url,
+                "loaded_title": app.loaded_title,
+                "loaded_playlist_entries": app.loaded_playlist_entries,
+                "thumbnail_image": app._thumbnail_image,
+                "thumbnail_label": app.thumbnail_label.configured[-1],
+                "progress_calls": list(app.load_progress.calls),
+            }
+
+        app_error = populated()
+        video_loader_module.VideoLoaderController(app_error)._apply_video_error(
+            app_error._load_request_id, "HTTP Error 403: Forbidden")
+
+        app_cancelled = populated()
+        video_loader_module.VideoLoaderController(
+            app_cancelled)._apply_video_load_cancelled(app_cancelled._load_request_id)
+
+        self.assertEqual(
+            cleared_state(app_error), cleared_state(app_cancelled),
+            "the failed and the cancelled load no longer clear the same state")
+
+        self.assertEqual(cleared_state(app_error), {
+            "video_duration": None,
+            "loaded_url": None,
+            "loaded_title": None,
+            "loaded_playlist_entries": None,
+            "thumbnail_image": None,
+            "thumbnail_label": {"image": None, "text": ""},
+            "progress_calls": ["stop", "pack_forget"],
+        }, "the terminal state was not fully cleared")
+
+        # The reset is one implementation: both handlers go through the same
+        # helper, which is what keeps the two states above identical.
+        controller = video_loader_module.VideoLoaderController
+        self.assertTrue(hasattr(controller, "_clear_loaded_video_state"),
+                        "the shared loaded-state reset no longer exists")
+        for name in ("_apply_video_error", "_apply_video_load_cancelled"):
+            source = inspect.getsource(getattr(controller, name))
+            self.assertIn("_clear_loaded_video_state", source,
+                          f"{name} no longer goes through the shared reset")
 
     def test_6_the_event_loop_survives_a_broken_handler_and_keeps_a_traceback(self):
         class LoopApp:

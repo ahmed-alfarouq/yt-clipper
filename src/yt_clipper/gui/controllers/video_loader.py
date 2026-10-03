@@ -487,17 +487,28 @@ class VideoLoaderController:
             logger.debug("Download button state could not be refreshed after the thumbnail step: %s", describe_failure(exc))
         app.set_status("Video loaded. Choose a time range and add it to the queue.", "#4caf50")
 
-    def _apply_video_error(self, request_id, error_message):
-        app = self.app
-        if request_id != app._load_request_id:
-            return
+    def _clear_loaded_video_state(self):
+        """Drop every trace of the loaded video: the shared terminal reset.
 
+        Both terminal outcomes of a load - a failure and a cancellation - pass
+        through exactly this state before showing their own message. They differ
+        only in what they say, never in the state they leave behind, so this is
+        one implementation instead of two copies that could drift apart.
+        """
+        app = self.app
         app.video_duration = None
         app.loaded_url = None
         app.loaded_title = None
         app.loaded_playlist_entries = None
         self._set_thumbnail(None, False)
         self._hide_load_progress()
+
+    def _apply_video_error(self, request_id, error_message):
+        app = self.app
+        if request_id != app._load_request_id:
+            return
+
+        self._clear_loaded_video_state()
         app.set_time_range_visible(True)
 
         try:
@@ -539,12 +550,7 @@ class VideoLoaderController:
             logger.debug("Ignoring cancellation of stale load request %s", request_id)
             return
 
-        app.video_duration = None
-        app.loaded_url = None
-        app.loaded_title = None
-        app.loaded_playlist_entries = None
-        self._set_thumbnail(None, False)
-        self._hide_load_progress()
+        self._clear_loaded_video_state()
 
         try:
             app.video_info_label.configure(
