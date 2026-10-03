@@ -71,10 +71,21 @@ class QueueController:
             )
             return
 
-        if app.loaded_url == url and app.loaded_playlist_entries:
+        if app.loaded_url == url and app.loaded_playlist_entries is not None:
             # Shared validated dataset. _enqueue_playlist applies the canonical
             # availability filter where the jobs are created, so the same list is
             # not filtered twice on the way there.
+            if not app.loaded_playlist_entries:
+                # Nothing is selected: the user excluded every video, or the
+                # playlist had none available. Refuse here rather than falling
+                # through to the single-video path below, which would queue the
+                # playlist URL itself as one clip.
+                messagebox.showerror(
+                    "No videos selected",
+                    "Every video in this playlist has been removed.\n"
+                    "Load the playlist again to choose videos to download.",
+                )
+                return
             self._enqueue_playlist(app.loaded_playlist_entries, audio_only,
                                    requested_path)
             self.reset_fields()

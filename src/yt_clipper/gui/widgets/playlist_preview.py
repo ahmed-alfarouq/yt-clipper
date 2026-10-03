@@ -32,7 +32,8 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
     """Scrollable playlist preview sorted oldest→newest.
 
     Displays thumbnail, title, publish date for each video.
-    Clicking a video opens its YouTube URL in the default browser.
+    Clicking a video opens its YouTube URL in the default browser; the removal
+    control on each card excludes that video from the playlist selection.
 
     Responsibilities:
     - Receives sorted (or unsorted) video list, sorts internally via
@@ -41,6 +42,8 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
     - Handles thumbnail fetching with in-memory cache, background threads
     - Handles empty, missing thumbnail/title/date, invalid URL gracefully
     - Clears previous preview when new playlist loaded
+    - Renders exactly the list it is given: it owns no playlist selection of
+      its own, so the preview and the download queue cannot disagree
     """
 
     def __init__(self, master, **kwargs):
@@ -51,6 +54,9 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
         self._thumbnail_cache: Dict[str, Any] = {}  # url -> CTkImage or None placeholder
         self._thumbnail_images_refs: List[Any] = []  # keep CTkImage alive
         self._request_id = 0
+        # Set by the application: called with the video the user excluded. The
+        # widget never decides what is selected, it only reports the intent.
+        self._remove_handler = None
 
         # Header
         self.header_label = ctk.CTkLabel(
@@ -103,6 +109,7 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
 
         self._videos = sorted_videos
         self._clear_items()
+        self._refresh_header()
 
         if not sorted_videos:
             self._show_empty_state("This playlist has no videos")
@@ -114,10 +121,21 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
         for idx, video in enumerate(sorted_videos):
             self._create_video_item(video, idx, current_req)
 
-        # Update header with count
-        self.header_label.configure(
-            text=f"Playlist Preview — {len(sorted_videos)} videos (oldest → newest)"
-        )
+    def set_remove_handler(self, handler):
+        """Register the callback invoked when the user excludes a video.
+
+        The application owns the playlist selection; the widget only reports
+        that a video should leave it, so the preview and the download queue
+        cannot end up disagreeing about what is selected.
+        """
+        self._remove_handler = handler
+
+    def _request_remove(self, video):
+        """Report that the user wants `video` out of the playlist selection."""
+        handler = self._remove_handler
+        if handler is None:
+            return
+        handler(video)
 
     def clear(self):
         """Clear preview (e.g., when loading new playlist or on reset)."""
@@ -135,6 +153,16 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
         self.header_label.configure(text="Playlist Preview (oldest → newest)")
 
     # ---------- Internal helpers ----------
+
+    def _refresh_header(self):
+        """Show how many videos the preview currently holds.
+
+        Shared by the initial render and by a re-render after an exclusion, so
+        the count can never drift from the list on screen.
+        """
+        self.header_label.configure(
+            text=f"Playlist Preview — {len(self._videos)} videos (oldest → newest)"
+        )
 
     def _clear_items(self):
         for widget in self.scroll_frame.winfo_children():
@@ -241,6 +269,24 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
             font=ctk.CTkFont(size=11),
         )
         date_label.pack(fill="x", anchor="w", pady=(2, 0))
+
+        # Removal control. Parked on the far side of the card so it never
+        # overlaps the title, and it is its own widget rather than one of the
+        # click-bound ones below: Tk does not bubble a child's click to its
+        # parent, so pressing this cannot also open the video.
+        remove_btn = ctk.CTkButton(
+            item_frame,
+            text="✕",
+            width=32,
+            height=28,
+            fg_color="gray25",
+            hover_color="#8f2f2f",
+            text_color="gray70",
+            corner_radius=6,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=lambda v=video: self._request_remove(v),
+        )
+        remove_btn.pack(side="right", padx=(0, 8), pady=8)
 
         # Click handling
         if is_valid_url:

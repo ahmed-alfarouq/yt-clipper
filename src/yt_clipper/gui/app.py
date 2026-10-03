@@ -177,6 +177,10 @@ class ClipperApp(ctk.CTk):
         # Placed in same general location as info_row, but hidden initially
         # Only one preview is visible at a time
         self.playlist_preview = PlaylistPreviewWidget(card)
+        # The preview only reports which video the user excluded; the loader
+        # owns the selection both the preview and the queue read.
+        self.playlist_preview.set_remove_handler(
+            self.video_loader.remove_playlist_video)
         # Do NOT pack playlist_preview initially; show single preview by default
         # It will be packed when a playlist URL is loaded
 

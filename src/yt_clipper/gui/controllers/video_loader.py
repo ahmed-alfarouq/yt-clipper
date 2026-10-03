@@ -392,6 +392,75 @@ class VideoLoaderController:
                 "#4caf50",
             )
 
+    def remove_playlist_video(self, video):
+        """Exclude one playlist video from the loaded selection.
+
+        The selection is shared state: dropping the entry here is what makes the
+        video disappear from the preview *and* keeps it out of the download
+        jobs, because the queue builds its jobs from this same list. A removed
+        video is never downloaded and then skipped - it never becomes a job.
+
+        Called by the playlist preview's per-card removal control.
+        """
+        app = self.app
+        entries = app.loaded_playlist_entries
+        if not entries:
+            # Nothing loaded, or every video is already excluded.
+            return
+
+        removed = self._drop_playlist_entry(entries, video)
+        if removed is None:
+            return
+
+        # The preview renders the selection, so it is re-rendered from the
+        # shared list instead of being told about one row: that way the preview
+        # and the queue can never disagree about what is selected.
+        app.playlist_preview.set_videos(entries)
+        if not entries:
+            app.playlist_preview._show_empty_state(
+                "No videos selected for download")
+        self._refresh_playlist_summary()
+        app.update_download_button_state()
+
+    @staticmethod
+    def _drop_playlist_entry(entries, video):
+        """Remove `video` from `entries`, preferring object identity.
+
+        Identity first so a playlist that lists the same video twice still drops
+        the row the user actually clicked. Returns the dropped entry, or None
+        when it was not in the selection.
+        """
+        for index, existing in enumerate(entries):
+            if existing is video:
+                return entries.pop(index)
+        for index, existing in enumerate(entries):
+            if existing == video:
+                return entries.pop(index)
+        return None
+
+    def _refresh_playlist_summary(self):
+        """Restate how many videos are still selected for download."""
+        app = self.app
+        remaining = len(app.loaded_playlist_entries or [])
+        if remaining:
+            app.video_info_label.configure(
+                text=(
+                    f"📃  {app.loaded_title}\n"
+                    f"{remaining} videos selected for download\n"
+                    "Removed videos are not queued"
+                ),
+                text_color="#4caf50",
+            )
+        else:
+            app.video_info_label.configure(
+                text=(
+                    f"📃  {app.loaded_title}\n"
+                    "No videos selected for download\n"
+                    "Load the playlist again to start over"
+                ),
+                text_color="#e6a817",
+            )
+
     def _apply_video_metadata(self, request_id, url, title, duration, entry=None):
         app = self.app
         if request_id != app._load_request_id:
