@@ -1484,19 +1484,63 @@ class TestDecorativeFailureContracts(ContractTestCase):
         self.assertIn("DEBUG", self.levels(cm))
 
     def test_6_a_missing_publish_date_is_recoverable_and_reported(self):
+        """§12: a missing publish date is recoverable and reported once.
+
+        The canonical failure must stay recoverable (None, never a fatal
+        download failure) and stay observable at WARNING, naming the real
+        cause. The second "legacy location" attempt is gone: core.utils
+        re-exports the very same function object, so that retry could only
+        re-raise what the canonical call had just raised - it never recovered
+        anything, it only duplicated the diagnostic. What is frozen here is
+        the contract, not the dead retry.
+        """
         from yt_clipper.core import utils as legacy_utils
 
+        # Stands in for the retired legacy import location: if production ever
+        # consults it again, this records the call instead of silently raising.
+        legacy_attempt = mock.Mock(side_effect=RuntimeError("legacy fallback ran"))
         with mock.patch.object(playlist_utils, "extract_publish_date",
-                               side_effect=RuntimeError("no date here")), \
-                mock.patch.object(legacy_utils, "extract_publish_date",
-                                  side_effect=RuntimeError("no date here either")), \
+                               side_effect=RuntimeError("canonical date failure")), \
+                mock.patch.object(legacy_utils, "extract_publish_date", legacy_attempt), \
                 self.capture() as cm:
             value = downloader._extract_publish_date_from_info({"id": "x"})
 
         self.assertIsNone(value, "optional metadata became a hard failure")
-        self.assertIn("WARNING", self.levels(cm))
+        self.assertIn("WARNING", self.levels(cm), "the recoverable failure was silent")
         self.assertIn("continuing without it", self.joined(cm))
-        self.assertIn("DEBUG", self.levels(cm), "the fallback attempt was invisible")
+        self.assertIn("canonical date failure", self.joined(cm),
+                      "the warning does not name the real cause")
+        self.assertNotIn("legacy fallback ran", self.joined(cm),
+                         "the retired legacy location was consulted")
+        self.assertNoLevel(cm, "ERROR", "a recoverable absence was escalated")
+        self.assertNotIn("DEBUG", self.levels(cm),
+                         "the impossible legacy fallback attempt still runs")
+        legacy_attempt.assert_not_called()
+
+        # User-visible behaviour is unchanged: every other metadata field still
+        # arrives through the public entry point, and only the optional date is
+        # absent - the failure is contained to its own field.
+        patcher, _ = helpers.patch_youtube_dl({VIDEO_URL: {
+            "id": "contractvid1",
+            "title": "Boundary video",
+            "duration": 120,
+            "thumbnail": "https://i.ytimg.com/vi/x/hq.jpg",
+            "upload_date": "20240101",
+            "timestamp": 1704067200,
+        }})
+        with patcher, mock.patch.object(playlist_utils, "extract_publish_date",
+                                        side_effect=RuntimeError("canonical date failure")), \
+                self.capture() as cm:
+            info = downloader.get_video_info(VIDEO_URL)
+
+        self.assertEqual(info["title"], "Boundary video")
+        self.assertEqual(info["duration"], 120)
+        self.assertEqual(info["thumbnail"], "https://i.ytimg.com/vi/x/hq.jpg")
+        self.assertEqual(info["upload_date"], "20240101")
+        self.assertEqual(info["timestamp"], 1704067200)
+        self.assertIsNone(info["publish_date"],
+                          "an unrelated metadata field absorbed the failure")
+        self.assertNoLevel(cm, "ERROR")
 
 
 # ---------------------------------------------------------------------------

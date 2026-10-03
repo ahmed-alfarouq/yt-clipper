@@ -226,19 +226,16 @@ def _extract_publish_date_from_info(info):
         from yt_clipper.core.playlist_utils import extract_publish_date
         return extract_publish_date(info)
     except Exception as exc:
-        logger.debug("playlist_utils.extract_publish_date unavailable (%s); "
-                     "trying the legacy location", describe_failure(exc))
-        try:
-            from yt_clipper.core.utils import extract_publish_date
-            return extract_publish_date(info)
-        except Exception as fallback_exc:
-            # A missing publish date only affects sorting/display, so the
-            # operation continues with the documented fallback (§12).
-            logger.warning(
-                "Could not determine publish date; continuing without it: %s",
-                describe_failure(fallback_exc),
-            )
-            return None
+        # A missing publish date only affects sorting/display, so the
+        # operation continues with the documented fallback (§12). This is the
+        # only extraction location: core.utils re-exports this same function
+        # object, so a second attempt there could only re-raise the same
+        # failure while hiding the real cause behind its own.
+        logger.warning(
+            "Could not determine publish date; continuing without it: %s",
+            describe_failure(exc),
+        )
+        return None
 
 
 def get_video_info(url, cancel_event=None, on_retry=None):
