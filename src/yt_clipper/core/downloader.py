@@ -175,6 +175,25 @@ def _sleep_cancellable(delay, cancel_event):
         remaining -= interval
 
 
+def _extract_with_retry(ydl_options, url, cancel_event=None, on_retry=None):
+    """Extract metadata from one URL under the shared retry/cancellation policy.
+
+    Both extraction paths need exactly this: build a YoutubeDL from the
+    caller's options, extract without downloading, and let `_retry_call` decide
+    how often that may be attempted. The closure below is re-entered for every
+    attempt, so each try gets a fresh YoutubeDL and closes its own context
+    manager - a session that hit a transient error is never reused.
+
+    The caller keeps ownership of `ydl_options` (single video vs flat playlist
+    listing) and of what a missing result means, so those stay at the call site.
+    """
+    def _do_extract():
+        with yt_dlp.YoutubeDL(cast(Any, ydl_options)) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    return _retry_call(_do_extract, cancel_event=cancel_event, on_retry=on_retry)
+
+
 def _extract_info(url, options=None, cancel_event=None, on_retry=None):
     ydl_options: dict[str, Any] = {
         "quiet": True,
@@ -185,11 +204,8 @@ def _extract_info(url, options=None, cancel_event=None, on_retry=None):
     if options:
         ydl_options.update(options)
 
-    def _do_extract():
-        with yt_dlp.YoutubeDL(cast(Any, ydl_options)) as ydl:
-            return ydl.extract_info(url, download=False)
-
-    info = _retry_call(_do_extract, cancel_event=cancel_event, on_retry=on_retry)
+    info = _extract_with_retry(ydl_options, url, cancel_event=cancel_event,
+                               on_retry=on_retry)
     if info is None:
         raise ValueError(f"Could not fetch video info for: {url}")
     _reject_playlist(info)
@@ -279,11 +295,8 @@ def expand_playlist(url, cancel_event=None, on_retry=None, max_videos=None):
     if max_videos:
         ydl_options["playlistend"] = max_videos
 
-    def _do_extract():
-        with yt_dlp.YoutubeDL(cast(Any, ydl_options)) as ydl:
-            return ydl.extract_info(url, download=False)
-
-    info = _retry_call(_do_extract, cancel_event=cancel_event, on_retry=on_retry)
+    info = _extract_with_retry(ydl_options, url, cancel_event=cancel_event,
+                               on_retry=on_retry)
     if info is None:
         raise ValueError(f"Could not fetch info for: {url}")
 
