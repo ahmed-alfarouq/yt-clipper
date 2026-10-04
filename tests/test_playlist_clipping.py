@@ -708,6 +708,124 @@ class TestGuiHasNoPlaylistRangeInput(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Action-state consistency: the Download button vs. the Download action
+# ---------------------------------------------------------------------------
+
+OTHER_URL = "https://www.youtube.com/watch?v=someothervideo"
+
+
+class ActionStateApp(FakeApp):
+    """FakeApp with the shipped URL/loaded-video comparison bound to it.
+
+    FakeApp answers unknown attributes with a permissive no-op, so the helper
+    `_has_valid_download_data` calls would silently succeed and the button would
+    look correct for the wrong reason. Binding the real implementation - the
+    same approach `test_playlist_item_removal` uses for the download-button
+    decision - makes the test observe the shipped logic.
+    """
+
+    def _url_names_the_loaded_video(self):
+        return ClipperApp._url_names_the_loaded_video(self)
+
+
+class TestDownloadActionStateConsistency(unittest.TestCase):
+    """The Download button must describe the video the Download action will use.
+
+    `download_clip()` picks its branch - and with it whether the end time is
+    validated against the loaded duration - by comparing the URL in the box
+    with the URL that was loaded:
+
+        if app.loaded_url == url and app.video_duration is not None:  # clamp
+        else: label = url                                          # no clamp
+
+    The button's enabled state is computed by a different predicate
+    (`_has_valid_download_data`) that never looks at the box at all, so the two
+    can disagree: the button is green for loaded state belonging to a video the
+    box no longer names, and the action it green-lights then runs the
+    unvalidated branch.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ytclip-actionstate-"))
+
+    def loaded_video_app(self, duration=200.0, start=25, end=88):
+        """An app in the state `_apply_video_metadata` leaves after a load."""
+        app = ActionStateApp(url=VIDEO_URL, entries=None, duration=duration,
+                             start_seconds=start, end_seconds=end,
+                             output_path=self.tmp / "clip.mp4")
+        self.addCleanup(app.harness.shutdown)
+        return app
+
+    def retype_url(self, app, url):
+        app.url_entry.delete(0, "end")
+        app.url_entry.insert(0, url)
+
+    # ---- the button state the GUI actually renders ----
+
+    def test_the_button_is_green_for_the_url_that_was_loaded(self):
+        app = self.loaded_video_app()
+        self.assertTrue(ClipperApp._has_valid_download_data(app),
+                        "a loaded video whose URL is still in the box is not "
+                        "downloadable")
+
+    def test_the_button_goes_dark_once_the_box_names_another_url(self):
+        app = self.loaded_video_app()
+        self.retype_url(app, OTHER_URL)
+        self.assertFalse(
+            ClipperApp._has_valid_download_data(app),
+            "the Download button stayed enabled for a URL the app never loaded")
+
+    def test_the_button_stays_dark_for_an_emptied_box(self):
+        app = self.loaded_video_app()
+        self.retype_url(app, "")
+        self.assertFalse(ClipperApp._has_valid_download_data(app))
+
+    # ---- what the stale green light actually allows ----
+
+    def test_a_mismatched_url_queues_an_unvalidated_clip(self):
+        """The defect, pinned: the guard the button was implying is skipped."""
+        app = self.loaded_video_app(duration=60.0, start=150, end=180)
+        self.retype_url(app, OTHER_URL)
+
+        recorder = DownloadCallRecorder()
+        controller = QueueController(app)
+        controller.render_queue = lambda: None
+        with recorder.patch(), self._no_config_write():
+            controller.download_clip()
+            self.assertTrue(wait_for(lambda: len(recorder.calls) == 1))
+
+        self.assertEqual(len(recorder.calls), 1,
+                         "the mismatched URL did not reach the downloader")
+        self.assertEqual(recorder.calls[0]["url"], OTHER_URL)
+        # 150-180 s is beyond the loaded video's 60 s and nothing complained:
+        # the clamp lives behind the URL comparison the box no longer satisfies.
+        self.assertEqual(recorder.calls[0]["start_sec"], 150)
+        self.assertEqual(recorder.calls[0]["end_sec"], 180)
+        self.assertEqual(app.queue_jobs[0].label, OTHER_URL,
+                         "the row was not labelled with the raw URL")
+
+    def test_the_same_range_is_refused_while_the_url_still_matches(self):
+        """Control: the guard exists and is only skipped by the mismatch."""
+        app = self.loaded_video_app(duration=60.0, start=150, end=180)
+
+        recorder = DownloadCallRecorder()
+        controller = QueueController(app)
+        controller.render_queue = lambda: None
+        with recorder.patch(), \
+                mock.patch.object(queue_controller_module, "messagebox") as messagebox, \
+                self._no_config_write():
+            controller.download_clip()
+
+        messagebox.showerror.assert_called_once()
+        self.assertIn("duration", messagebox.showerror.call_args[0][1])
+        self.assertEqual(recorder.calls, [])
+
+    @staticmethod
+    def _no_config_write():
+        return mock.patch("yt_clipper.core.config.save_config", lambda *a, **k: None)
+
+
+# ---------------------------------------------------------------------------
 # GUI/CLI parity
 # ---------------------------------------------------------------------------
 

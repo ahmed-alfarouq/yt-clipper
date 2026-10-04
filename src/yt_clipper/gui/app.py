@@ -459,7 +459,15 @@ class ClipperApp(ctk.CTk):
         Uses shared application state that is also used by preview and queue:
         - Single video: video_duration and loaded_url present, no playlist entries
         - Playlist: loaded_playlist_entries non-empty (already filtered for availability)
+
+        The URL in the box has to name the loaded video as well, because
+        `download_clip()` picks its branch - and with it whether the end time is
+        clamped to the loaded duration - by the very same comparison. Without it
+        the button is green for state belonging to a video the box no longer
+        names, and the click it invites runs the unvalidated branch instead.
         """
+        if not self._url_names_the_loaded_video():
+            return False
         # Playlist case: filtered available entries
         if self.loaded_playlist_entries is not None:
             try:
@@ -485,6 +493,24 @@ class ClipperApp(ctk.CTk):
                     "disabled: %s", describe_failure(exc))
                 return False
         return False
+
+    def _url_names_the_loaded_video(self) -> bool:
+        """True when the URL box still names the video that is loaded.
+
+        The one comparison `download_clip()` uses to decide which video it is
+        about to clip, read the same way here so the button and the action can
+        never disagree about it.
+
+        A guarded read (§11): a box that cannot be read means "not the loaded
+        video", which keeps the button disabled rather than guessing.
+        """
+        try:
+            return self.url_entry.get().strip() == self.loaded_url
+        except Exception as exc:
+            logger.debug(
+                "URL box could not be read; treating it as not naming the "
+                "loaded video: %s", describe_failure(exc))
+            return False
 
     def update_download_button_state(self):
         """Enable/disable download button based on validated data."""
