@@ -144,6 +144,27 @@ class FakeTimeInput:
         self._seconds = seconds
 
 
+class RecordingSlider:
+    """Stands in for a CTkSlider: remembers to/state and the current value."""
+
+    def __init__(self, value=0, to=100, state="disabled"):
+        self.value = value
+        self.to = to
+        self.state = state
+
+    def configure(self, **kwargs):
+        if "to" in kwargs:
+            self.to = kwargs["to"]
+        if "state" in kwargs:
+            self.state = kwargs["state"]
+
+    def set(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
 class QueueHarness:
     """The REAL SequentialDownloadQueue plus an event recorder."""
 
@@ -208,6 +229,49 @@ class FakeLoaderApp:
         if name.startswith("__"):
             raise AttributeError(name)
         return Permissive()
+
+
+class TimeRangeLoaderApp(FakeLoaderApp):
+    """FakeLoaderApp with observable clip-range widgets.
+
+    FakeLoaderApp answers unknown attributes with a permissive no-op, which
+    turns every slider/label call into nothing observable. The clip-range block
+    is the state under test here, so it gets real doubles instead - and
+    `reset_time_range` is delegated to the shipped ClipperApp implementation so
+    the test exercises the real method rather than a copy of it.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.start_input = FakeTimeInput(0)
+        self.end_input = FakeTimeInput(0)
+        self.start_slider = RecordingSlider(0)
+        self.end_slider = RecordingSlider(100)
+        self.clip_length_label = RecordingWidget()
+
+    def reset_time_range(self):
+        return ClipperApp.reset_time_range(self)
+
+    def loaded_range_state(self):
+        """Everything the clip-range block currently shows, as one snapshot."""
+        return {
+            "start_input": self.start_input.get_seconds(),
+            "end_input": self.end_input.get_seconds(),
+            "start_slider": (self.start_slider.get(), self.start_slider.to,
+                             self.start_slider.state),
+            "end_slider": (self.end_slider.get(), self.end_slider.to,
+                           self.end_slider.state),
+            "clip_length": self.clip_length_label.text,
+        }
+
+
+EMPTY_RANGE_STATE = {
+    "start_input": 0,
+    "end_input": 0,
+    "start_slider": (0, 100, "disabled"),
+    "end_slider": (100, 100, "disabled"),
+    "clip_length": "Clip length: —",
+}
 
 
 class FakeFFmpegProcess:
@@ -1859,6 +1923,58 @@ class TestGuiStateContracts(ContractTestCase):
             source = inspect.getsource(getattr(controller, name))
             self.assertIn("_clear_loaded_video_state", source,
                           f"{name} no longer goes through the shared reset")
+
+    def test_5c_both_terminal_load_states_also_empty_the_clip_range(self):
+        """A failed/cancelled load must not leave the previous range on screen.
+
+        The clip range belongs to the loaded video, so the same reset that drops
+        the loaded video has to drop the range too. Otherwise the window shows
+        "no video loaded" next to a Start/End pair and a clip length that belong
+        to a video the app has already discarded - and the sliders stay enabled
+        over the discarded video's scale, so the user can still edit them.
+        """
+        def populated():
+            app = TimeRangeLoaderApp()
+            app.video_duration = 215.0
+            app.loaded_url = VIDEO_URL
+            app.loaded_title = "Some video"
+            # What _apply_video_metadata leaves behind for a 3m35s video.
+            app.start_input.set_seconds(60)
+            app.end_input.set_seconds(120)
+            app.start_slider.configure(to=215, state="normal")
+            app.end_slider.configure(to=215, state="normal")
+            app.start_slider.set(60)
+            app.end_slider.set(120)
+            app.clip_length_label.configure(text="Clip length: 1:00")
+            self.assertNotEqual(app.loaded_range_state(), EMPTY_RANGE_STATE)
+            return app
+
+        for outcome in ("error", "cancelled"):
+            with self.subTest(outcome=outcome):
+                app = populated()
+                handler = getattr(
+                    video_loader_module.VideoLoaderController(app),
+                    "_apply_video_error" if outcome == "error"
+                    else "_apply_video_load_cancelled")
+                handler(*( (app._load_request_id, "HTTP Error 403: Forbidden")
+                           if outcome == "error" else (app._load_request_id,) ))
+
+                self.assertEqual(
+                    app.loaded_range_state(), EMPTY_RANGE_STATE,
+                    f"a {outcome} load left the previous clip range on screen")
+
+    def test_5d_reset_time_range_restores_the_state_the_window_starts_in(self):
+        """The empty clip range is exactly the one ClipperApp builds at startup."""
+        self.assertTrue(hasattr(ClipperApp, "reset_time_range"),
+                        "ClipperApp no longer owns a clip-range reset")
+
+        app = TimeRangeLoaderApp()
+        ClipperApp.reset_time_range(app)
+        self.assertEqual(app.loaded_range_state(), EMPTY_RANGE_STATE)
+
+        # Idempotent: calling it again changes nothing further.
+        ClipperApp.reset_time_range(app)
+        self.assertEqual(app.loaded_range_state(), EMPTY_RANGE_STATE)
 
     def test_6_the_event_loop_survives_a_broken_handler_and_keeps_a_traceback(self):
         class LoopApp:

@@ -569,6 +569,7 @@ class VideoLoaderController:
         app.loaded_url = None
         app.loaded_title = None
         app.loaded_playlist_entries = None
+        app.reset_time_range()
         self._set_thumbnail(None, False)
         self._hide_load_progress()
 

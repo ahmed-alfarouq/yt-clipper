@@ -544,6 +544,7 @@ class QueueController:
         app.loaded_title = None
         app.loaded_playlist_entries = None
         app.video_duration = None
+        app.reset_time_range()
         app.video_loader._set_thumbnail(None, False)
         try:
             app.playlist_preview.clear()

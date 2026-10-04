@@ -713,6 +713,33 @@ class ClipperApp(ctk.CTk):
             text=f"Clip length: {format_seconds(max(0, length))}"
         )
 
+    def reset_time_range(self):
+        """Return the Start/End block to the empty state it starts the window in.
+
+        The clip range describes the loaded video, so every path that drops the
+        loaded video - a failed or cancelled load, and the form reset after a
+        clip is queued - has to drop the range with it. Without this the window
+        shows "No video loaded yet" beside a Start/End pair and a clip length
+        belonging to a video the app has already discarded, and the sliders stay
+        enabled over that video's scale so the user can still edit them.
+
+        Presentation-only: a widget that refuses a call leaves the rest of the
+        reset applied rather than aborting it (§11).
+        """
+        try:
+            self.start_input.set_seconds(0)
+            self.end_input.set_seconds(0)
+            self.start_slider.configure(to=100, state="disabled")
+            self.end_slider.configure(to=100, state="disabled")
+            self.start_slider.set(0)
+            self.end_slider.set(100)
+            self.clip_length_label.configure(text="Clip length: —")
+        except Exception as exc:
+            logger.debug(
+                "Clip range could not be fully reset; the loaded video is "
+                "already gone: %s", describe_failure(exc)
+            )
+
 
 def _make_id_counter():
     import itertools

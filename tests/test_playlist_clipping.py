@@ -49,7 +49,12 @@ from yt_clipper.core.playlist_utils import detect_youtube_url_type  # noqa: E402
 # Presentation-only GUI doubles shared with the failure-contract tests. They
 # were defined here verbatim a second time; import the single definition so the
 # two suites cannot drift apart.
-from test_failure_contracts import FakeVar, Permissive, RecordingWidget  # noqa: E402
+from test_failure_contracts import (  # noqa: E402,F401
+    FakeVar,
+    Permissive,
+    RecordingSlider,
+    RecordingWidget,
+)
 
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLPHASE2TEST"
 VIDEO_URL = "https://www.youtube.com/watch?v=singlevideo1"
@@ -170,6 +175,46 @@ class FakeApp:
         if name.startswith("__"):
             raise AttributeError(name)
         return Permissive()
+
+
+class TimeRangeApp(FakeApp):
+    """FakeApp with observable clip-range widgets and the real reset method.
+
+    FakeApp answers unknown attributes with a permissive no-op, so the sliders
+    and the clip-length label have to be real doubles for the reset to be
+    observable. `reset_time_range` is delegated to the shipped ClipperApp so the
+    test exercises the real implementation rather than a copy of it.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.start_slider = RecordingSlider(self.start_input.get_seconds())
+        self.end_slider = RecordingSlider(self.end_input.get_seconds())
+        self.clip_length_label = RecordingWidget()
+
+    def reset_time_range(self):
+        return ClipperApp.reset_time_range(self)
+
+    def loaded_range_state(self):
+        return {
+            "start_input": self.start_input.get_seconds(),
+            "end_input": self.end_input.get_seconds(),
+            "start_slider": (self.start_slider.get(), self.start_slider.to,
+                             self.start_slider.state),
+            "end_slider": (self.end_slider.get(), self.end_slider.to,
+                           self.end_slider.state),
+            "clip_length": self.clip_length_label.text,
+        }
+
+
+# The clip-range block as ClipperApp builds it for a window with no video in it.
+EMPTY_RANGE = {
+    "start_input": 0,
+    "end_input": 0,
+    "start_slider": (0, 100, "disabled"),
+    "end_slider": (100, 100, "disabled"),
+    "clip_length": "Clip length: —",
+}
 
 
 class GuiTestCase(unittest.TestCase):
@@ -586,6 +631,39 @@ class TestGuiPlaylistJobs(GuiTestCase):
         messagebox.showerror.assert_called_once()
         self.assertIn("duration", messagebox.showerror.call_args[0][1])
         self.assertEqual(recorder.calls, [])
+
+    def test_gui_queueing_a_clip_empties_the_clip_range(self):
+        """Queueing must not leave the queued range on screen for no video.
+
+        `download_clip()` resets the form, and the clip range belongs to the
+        video that was just queued: leaving it behind shows "No video loaded
+        yet" next to a Start/End pair and a clip length that describe a video
+        the app has already dropped, and leaves the sliders enabled over that
+        video's scale.
+        """
+        app = TimeRangeApp(url=VIDEO_URL, entries=None, duration=200.0,
+                           start_seconds=25, end_seconds=88,
+                           output_path=self.tmp / "clip.mp4")
+        # What _apply_video_metadata leaves behind for the loaded video.
+        app.start_slider.configure(to=200, state="normal")
+        app.end_slider.configure(to=200, state="normal")
+        app.start_slider.set(25)
+        app.end_slider.set(88)
+        app.clip_length_label.configure(text="Clip length: 1:03")
+        self.assertNotEqual(app.loaded_range_state(), EMPTY_RANGE)
+
+        recorder = DownloadCallRecorder()
+        controller = self.make_controller(app)
+        with recorder.patch(), self._no_config_write():
+            controller.download_clip()
+            self.assertTrue(wait_for(lambda: len(recorder.calls) == 1))
+
+        self.assertEqual(
+            (recorder.calls[0]["start_sec"], recorder.calls[0]["end_sec"]),
+            (25, 88), "the queued range itself must not change")
+        self.assertEqual(
+            app.loaded_range_state(), EMPTY_RANGE,
+            "queueing a clip left the previous clip range on screen")
 
 
 class TestGuiHasNoPlaylistRangeInput(unittest.TestCase):
