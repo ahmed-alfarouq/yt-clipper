@@ -495,13 +495,42 @@ class ClipperApp(ctk.CTk):
                 import math
                 if isinstance(self.video_duration, (int, float)) and not isinstance(self.video_duration, bool):
                     if math.isfinite(self.video_duration) and self.video_duration > 0:
-                        return True
+                        return self._clip_range_is_downloadable()
             except Exception as exc:
                 logger.debug(
                     "Loaded duration could not be validated; download stays "
                     "disabled: %s", describe_failure(exc))
                 return False
         return False
+
+    def _clip_range_is_downloadable(self) -> bool:
+        """True when the Start/End pair is a range `download_clip()` would take.
+
+        The action refuses a non-positive range ("End time must be after start
+        time.") and an end past the loaded duration ("End time cannot be later
+        than the loaded video's duration."). Judging only the loaded video left
+        the button green for both, so the click it invited could only ever end
+        in a modal error - the same predicate/action split 5C closed for the
+        URL, one level down.
+
+        A playlist never reaches here: it downloads every video in full, so the
+        range is hidden and `start_sec`/`end_sec` are None.
+        """
+        try:
+            start_sec = self.start_input.get_seconds()
+            end_sec = self.end_input.get_seconds()
+        except Exception as exc:
+            # A guarded read (§11): a range that cannot be read is not one the
+            # user has set, so the loaded video stays the whole of the decision
+            # rather than the button guessing.
+            logger.debug("Clip range could not be read; judging by the loaded "
+                         "video only: %s", describe_failure(exc))
+            return True
+        if not isinstance(start_sec, (int, float)) or isinstance(start_sec, bool):
+            return True
+        if not isinstance(end_sec, (int, float)) or isinstance(end_sec, bool):
+            return True
+        return end_sec > start_sec and end_sec <= self.video_duration
 
     def _url_names_the_loaded_video(self) -> bool:
         """True when the URL box still names the video that is loaded.
@@ -711,6 +740,9 @@ class ClipperApp(ctk.CTk):
         finally:
             self._syncing = False
         self.update_clip_length()
+        # The Download button's predicate reads these same two inputs, so it
+        # has to be recomputed here too (Phase 5I's lesson for the URL box).
+        self.update_download_button_state()
 
     def on_end_change(self, seconds):
         if self._syncing:
@@ -727,6 +759,9 @@ class ClipperApp(ctk.CTk):
         finally:
             self._syncing = False
         self.update_clip_length()
+        # The Download button's predicate reads these same two inputs, so it
+        # has to be recomputed here too (Phase 5I's lesson for the URL box).
+        self.update_download_button_state()
 
     def on_start_slide(self, value):
         if self._syncing:
@@ -740,6 +775,9 @@ class ClipperApp(ctk.CTk):
         finally:
             self._syncing = False
         self.update_clip_length()
+        # The Download button's predicate reads these same two inputs, so it
+        # has to be recomputed here too (Phase 5I's lesson for the URL box).
+        self.update_download_button_state()
 
     def on_end_slide(self, value):
         if self._syncing:
@@ -753,6 +791,9 @@ class ClipperApp(ctk.CTk):
         finally:
             self._syncing = False
         self.update_clip_length()
+        # The Download button's predicate reads these same two inputs, so it
+        # has to be recomputed here too (Phase 5I's lesson for the URL box).
+        self.update_download_button_state()
 
     def update_clip_length(self):
         length = self.end_slider.get() - self.start_slider.get()

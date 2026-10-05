@@ -829,12 +829,28 @@ class ActionStateApp(FakeApp):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.download_button = StateButton()
+        # on_start_change/on_end_change bail out on a truthy _syncing, and FakeApp
+        # answers unknown attributes with a truthy no-op - which would make the
+        # real handler return before it reached the button at all.
+        self._syncing = False
+        # The clip-range block has to be observable for the range half of the
+        # predicate: FakeApp answers unknown attributes with a no-op, which
+        # would make end_slider.get() return None and blow up on_start_change.
+        self.start_slider = RecordingSlider(self.start_input.get_seconds())
+        self.end_slider = RecordingSlider(self.end_input.get_seconds())
+        self.clip_length_label = RecordingWidget()
 
     def _url_names_the_loaded_video(self):
         return ClipperApp._url_names_the_loaded_video(self)
 
+    def _clip_range_is_downloadable(self):
+        return ClipperApp._clip_range_is_downloadable(self)
+
     def _has_valid_download_data(self):
         return ClipperApp._has_valid_download_data(self)
+
+    def update_clip_length(self):
+        return ClipperApp.update_clip_length(self)
 
     def update_download_button_state(self):
         return ClipperApp.update_download_button_state(self)
@@ -997,6 +1013,85 @@ class TestDownloadActionStateConsistency(unittest.TestCase):
             "trace_add", source,
             "nothing registers a change notification on the URL box, so the "
             "Download button is never recomputed while it is being edited")
+
+    # ---- the predicate has to cover what the action enforces ----
+
+    def test_the_predicate_rejects_a_range_the_action_refuses(self):
+        """`download_clip()` refuses two ranges the predicate was blind to.
+
+        It answers "End time must be after start time." for a non-positive
+        range and "End time cannot be later than the loaded video's duration."
+        for an end past the duration. `_has_valid_download_data()` looked only
+        at the loaded video, so both still read as downloadable - the same
+        predicate/action split 5C closed for the URL, one level down.
+        """
+        app = self.loaded_video_app(duration=60.0, start=0, end=60)
+        self.assertTrue(ClipperApp._has_valid_download_data(app),
+                        "a full-video range on a loaded video is downloadable")
+
+        app.start_input.set_seconds(60)          # Start dragged onto End
+        self.assertFalse(
+            ClipperApp._has_valid_download_data(app),
+            "a zero-length range is not downloadable")
+
+        app.start_input.set_seconds(0)
+        app.end_input.set_seconds(90)            # End past the 60 s duration
+        self.assertFalse(
+            ClipperApp._has_valid_download_data(app),
+            "an end past the loaded duration is not downloadable")
+
+    def test_the_button_goes_dark_for_a_range_the_action_refuses(self):
+        """The rendered button must not invite a click that can only error."""
+        app = self.loaded_video_app(duration=60.0, start=0, end=60)
+        app.update_download_button_state()
+        self.assertEqual(app.download_button.state, "normal",
+                         "a full-video range is downloadable")
+
+        app.start_input.set_seconds(60)
+        app.update_download_button_state()
+        self.assertEqual(
+            app.download_button.state, "disabled",
+            "the Download button stayed green for a zero-length range")
+
+    def test_the_button_is_recomputed_when_the_time_range_changes(self):
+        """The range controls need the recompute the URL box got in 5I.
+
+        Without it the predicate is right and the rendered button is not: the
+        button keeps the state of the range that was loaded and stays green
+        until something unrelated recomputes it.
+        """
+        app = self.loaded_video_app(duration=60.0, start=0, end=60)
+        app.update_download_button_state()
+        self.assertEqual(app.download_button.state, "normal")
+
+        # The user drags Start onto End. No test code recomputes the button.
+        ClipperApp.on_start_slide(app, 60)
+
+        self.assertEqual(
+            app.download_button.state, "disabled",
+            "the Download button was not recomputed when the range changed")
+
+    def test_a_playlist_range_is_not_judged_by_the_clip_range(self):
+        """Control: a playlist downloads every video in full.
+
+        The clip range is hidden and unused there (`start_sec`/`end_sec` are
+        None), so a stale range in the box must not disable Download for a
+        playlist that still has videos selected.
+        """
+        entries = [helpers.playlist_entry("aaaaaaaaaaa", "alpha")]
+        app = ActionStateApp(url=PLAYLIST_URL, entries=entries, duration=None,
+                             start_seconds=25, end_seconds=88,
+                             output_path=self.tmp / "clip.mp4")
+        self.addCleanup(app.harness.shutdown)
+        app.update_download_button_state()
+        self.assertTrue(ClipperApp._has_valid_download_data(app),
+                        "a playlist with a selected video is not downloadable")
+
+        app.start_input.set_seconds(88)          # a range the action would refuse
+        app.end_input.set_seconds(25)
+        self.assertTrue(
+            ClipperApp._has_valid_download_data(app),
+            "the clip range was applied to a playlist, which has no clip range")
 
     @staticmethod
     def _no_config_write():
