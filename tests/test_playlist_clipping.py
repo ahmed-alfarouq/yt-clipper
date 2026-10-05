@@ -52,6 +52,7 @@ from yt_clipper.core.playlist_utils import detect_youtube_url_type  # noqa: E402
 from test_failure_contracts import (  # noqa: E402,F401
     FakeVar,
     Permissive,
+    RecordingProgressBar,
     RecordingSlider,
     RecordingWidget,
 )
@@ -664,6 +665,88 @@ class TestGuiPlaylistJobs(GuiTestCase):
         self.assertEqual(
             app.loaded_range_state(), EMPTY_RANGE,
             "queueing a clip left the previous clip range on screen")
+
+
+class TestMixedPlaylistBatchProgressBar(GuiTestCase):
+    """A batch where one video fails must not end on a full progress bar.
+
+    Driven through the REAL SequentialDownloadQueue so the event order is the
+    one the worker really produces, not a hand-written replay: the first video
+    fails, the rest succeed, and the shared determinate bar is checked once
+    the queue reports itself idle.
+    """
+
+    def _run_batch(self, failing_url):
+        app = self.make_app(url=PLAYLIST_URL, entries=self.entries)
+        controller = self.make_controller(app)
+        app.progress = RecordingProgressBar()
+        app.queue_controller = controller
+
+        # The worker emits on its own thread, so each event is routed through
+        # the shipped main-thread router: the controller's real handlers have
+        # to run for the bar to be moved at all.
+        def on_event(name, *payload):
+            # Dispatch first, record second: a recorded "queue_idle" then means
+            # the batch summary has already been applied, so the assertions
+            # below never race the worker thread.
+            ClipperApp._handle_ui_event(app, name, payload)
+            app.harness.events.append((name, payload))
+
+        app.download_queue = SequentialDownloadQueue(on_event)
+        self.addCleanup(app.download_queue.shutdown)
+
+        # `_enqueue_playlist` submits the batch one job at a time, and the
+        # worker can finish the first job before the caller has queued the
+        # second - which makes the queue report itself idle mid-submission.
+        # Holding the first job until the whole batch is queued keeps this test
+        # about the batch outcome rather than about that submission race.
+        release = threading.Event()
+
+        def flaky(url, start_sec, end_sec, *args, **kwargs):
+            release.wait(10.0)
+            if url.endswith(failing_url):
+                raise RuntimeError("HTTP Error 403: Forbidden")
+            hook = kwargs.get("progress_hook")
+            if hook:
+                hook({"status": "downloading", "downloaded_bytes": 40,
+                      "total_bytes": 100, "_percent_str": " 40.0%"})
+            return "/tmp/ok.mp4"
+
+        with mock.patch.object(downloader, "download_clip", side_effect=flaky), \
+                self._no_config_write():
+            controller.download_clip()
+            release.set()
+            self.assertTrue(
+                wait_for(lambda: "queue_idle" in app.harness.event_names()),
+                "the playlist batch never reported itself idle")
+        return app
+
+    def test_a_failure_before_the_last_video_leaves_the_bar_empty(self):
+        app = self._run_batch("aaaaaaaaaaa")
+
+        statuses = {job.status for job in app.queue_jobs}
+        self.assertEqual(statuses, {"Done", "Error"},
+                         "the batch did not run every video to a terminal state")
+        self.assertIn("1 failed", app.statuses[-1])
+        self.assertEqual(
+            app.progress.value, 0.0,
+            "a failure before the last video left the progress bar full, "
+            "which reads as every video having downloaded")
+
+    def test_a_failure_in_the_last_video_also_leaves_the_bar_empty(self):
+        """Control: the position of the failure must not change the outcome."""
+        app = self._run_batch("ccccccccccc")
+
+        self.assertIn("1 failed", app.statuses[-1])
+        self.assertEqual(app.progress.value, 0.0)
+
+    def test_an_all_successful_batch_still_fills_the_bar(self):
+        """Control: the success path is unchanged by the failure handling."""
+        app = self._run_batch("no-such-video")
+
+        self.assertEqual({job.status for job in app.queue_jobs}, {"Done"})
+        self.assertIn("completed", app.statuses[-1])
+        self.assertEqual(app.progress.value, 1.0)
 
 
 class TestGuiHasNoPlaylistRangeInput(unittest.TestCase):

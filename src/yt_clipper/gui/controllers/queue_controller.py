@@ -515,6 +515,13 @@ class QueueController:
         self.last_output_path = None
 
         if error_count:
+            # A failure is the same kind of terminal state as a cancellation,
+            # so the bar must not read as success beside the failure summary
+            # (Phase 5D). A success later in the same batch writes 1.0 over the
+            # reset `_apply_job_error` made, and this is the only place that
+            # knows the batch as a whole failed - so it is the one that has to
+            # leave the bar the way the failure did.
+            app.progress.set(0)
             app.set_status(
                 f"Downloads finished: {done_count} completed, {error_count} failed",
                 "#e6a817",

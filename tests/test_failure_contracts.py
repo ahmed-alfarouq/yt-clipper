@@ -2086,6 +2086,75 @@ class TestGuiStateContracts(ContractTestCase):
         self.assertEqual(app.progress.value, 1.0)
         self.assertIn("1 completed", app.statuses[-1][0])
 
+    def test_a_failure_earlier_in_a_batch_leaves_the_progress_bar_empty(self):
+        """One failed video must not be masked by the successes after it.
+
+        A playlist batch runs its jobs one at a time and every success fills
+        the shared determinate bar to 1.0. When a video fails in the middle,
+        `_apply_job_error` resets the bar - and then the next success fills it
+        again, so the batch ends with a FULL bar next to "1 failed" and an
+        Error row, which reads as every video having downloaded.
+        `_queue_idle` is the only place that knows the batch as a whole
+        failed, so it is the one that has to leave the bar the way the
+        failure did - exactly the invariant Phase 5D established for the
+        single-job case.
+        """
+        app = ProgressTerminalApp()
+        controller = self.make_controller(app)
+        first = self.make_job(app, 1, "alpha")
+        second = self.make_job(app, 2, "beta")
+        third = self.make_job(app, 3, "gamma")
+
+        # The order the queue really emits for a batch whose 2nd job fails.
+        for job in (first, second, third):
+            app._active_job_id = job.id
+            controller._apply_job_started(job.id)
+            controller._apply_download_progress(
+                job.id, {"status": "downloading", "_percent_str": "60%"})
+            if job is second:
+                controller._apply_job_error(job.id, "HTTP Error 403: Forbidden")
+            else:
+                controller._apply_job_done(job.id)
+        controller._queue_idle()
+
+        self.assertEqual((first.status, second.status, third.status),
+                         ("Done", "Error", "Done"),
+                         "the batch did not run to completion")
+        self.assertIn("1 failed", app.statuses[-1][0])
+        self.assertEqual(
+            app.progress.value, 0.0,
+            "a failure earlier in the batch left the progress bar full, which "
+            "reads as every video having downloaded")
+
+    def test_a_batch_that_ends_in_failure_never_rests_on_a_full_bar(self):
+        """Every position of the failure must end on the same empty bar.
+
+        The failure is not always the last job, so the resting value must not
+        depend on where in the batch it happened.
+        """
+        def bar_after_failure_at(position, total=3):
+            app = ProgressTerminalApp()
+            controller = self.make_controller(app)
+            jobs = [self.make_job(app, i + 1, f"v{i}") for i in range(total)]
+            for index, job in enumerate(jobs):
+                app._active_job_id = job.id
+                controller._apply_job_started(job.id)
+                controller._apply_download_progress(
+                    job.id, {"status": "downloading", "_percent_str": "60%"})
+                if index == position:
+                    controller._apply_job_error(job.id, "boom")
+                else:
+                    controller._apply_job_done(job.id)
+            controller._queue_idle()
+            return app.progress.value
+
+        for position in range(3):
+            with self.subTest(failing_position=position):
+                self.assertEqual(
+                    bar_after_failure_at(position), 0.0,
+                    f"a batch failing at position {position} did not end on "
+                    f"an empty progress bar")
+
     def test_6_the_event_loop_survives_a_broken_handler_and_keeps_a_traceback(self):
         class LoopApp:
             _closing = False
