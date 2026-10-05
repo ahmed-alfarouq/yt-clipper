@@ -136,12 +136,21 @@ class ClipperApp(ctk.CTk):
         url_row = ctk.CTkFrame(card, fg_color="transparent")
         url_row.pack(fill="x", padx=20)
         self.url_row = url_row
+        # The URL box is the one input the Download button's enabled state is
+        # compared against (Phase 5C), so it needs a change notification: a
+        # plain entry tells the app nothing when its text is edited.
+        self.url_var = ctk.StringVar()
         self.url_entry = ctk.CTkEntry(
             url_row,
+            textvariable=self.url_var,
             placeholder_text="https://youtube.com/watch?v=...",
             height=40,
         )
         self.url_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        # Nothing writes the variable during __init__, so this cannot fire
+        # before download_button exists; `update_download_button_state` is
+        # guarded anyway (§11).
+        self.url_var.trace_add("write", self._on_url_changed)
         self.load_btn = ctk.CTkButton(
             url_row,
             text="Load Video",
@@ -511,6 +520,18 @@ class ClipperApp(ctk.CTk):
                 "URL box could not be read; treating it as not naming the "
                 "loaded video: %s", describe_failure(exc))
             return False
+
+    def _on_url_changed(self, *_args):
+        """Recompute the Download button while the URL box is being edited.
+
+        `_has_valid_download_data()` compares the box with the loaded URL
+        (Phase 5C), so the decision is only as fresh as the last time it was
+        computed. Without this the button keeps the state of the load that
+        filled the box and stays green for a URL the app never loaded - the
+        click it then invites queues a clip whose end time is never clamped to
+        any loaded duration, labelled with the raw URL.
+        """
+        self.update_download_button_state()
 
     def update_download_button_state(self):
         """Enable/disable download button based on validated data."""

@@ -18,6 +18,7 @@ Run with:  python -m unittest discover -s tests -v
 """
 
 import itertools
+import inspect
 import tempfile
 import threading
 import unittest
@@ -797,6 +798,24 @@ class TestGuiHasNoPlaylistRangeInput(unittest.TestCase):
 OTHER_URL = "https://www.youtube.com/watch?v=someothervideo"
 
 
+class StateButton:
+    """The Download button with its enabled state observable.
+
+    FakeApp answers unknown attributes with a permissive no-op, so
+    `download_button.configure(state=...)` would leave nothing to assert on and
+    the button would look correct for the wrong reason.
+    """
+
+    def __init__(self, state="disabled"):
+        self.state = state
+        self.configured = []
+
+    def configure(self, **kwargs):
+        self.configured.append(kwargs)
+        if "state" in kwargs:
+            self.state = kwargs["state"]
+
+
 class ActionStateApp(FakeApp):
     """FakeApp with the shipped URL/loaded-video comparison bound to it.
 
@@ -807,8 +826,18 @@ class ActionStateApp(FakeApp):
     decision - makes the test observe the shipped logic.
     """
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.download_button = StateButton()
+
     def _url_names_the_loaded_video(self):
         return ClipperApp._url_names_the_loaded_video(self)
+
+    def _has_valid_download_data(self):
+        return ClipperApp._has_valid_download_data(self)
+
+    def update_download_button_state(self):
+        return ClipperApp.update_download_button_state(self)
 
 
 class TestDownloadActionStateConsistency(unittest.TestCase):
@@ -837,6 +866,9 @@ class TestDownloadActionStateConsistency(unittest.TestCase):
                              start_seconds=start, end_seconds=end,
                              output_path=self.tmp / "clip.mp4")
         self.addCleanup(app.harness.shutdown)
+        # `_apply_video_metadata` ends by rendering the button from the
+        # predicate, so a loaded app starts with the button in that state.
+        app.update_download_button_state()
         return app
 
     def retype_url(self, app, url):
@@ -902,6 +934,69 @@ class TestDownloadActionStateConsistency(unittest.TestCase):
         messagebox.showerror.assert_called_once()
         self.assertIn("duration", messagebox.showerror.call_args[0][1])
         self.assertEqual(recorder.calls, [])
+
+    # ---- the rendered button has to follow the box, not just the predicate ----
+
+    def test_editing_the_url_box_takes_the_green_off_the_download_button(self):
+        """The button the user sees must be recomputed when the box changes.
+
+        Phase 5C made `_has_valid_download_data()` compare the box with the
+        loaded URL, so the *decision* is right. But the button is only
+        recomputed when a load finishes: the box has no change notification, so
+        retyping it leaves the button green for a video the app never loaded -
+        and the click it invites runs the unvalidated branch 5C closed.
+        """
+        app = self.loaded_video_app()
+        app.update_download_button_state()
+        self.assertEqual(app.download_button.state, "normal",
+                         "a loaded video whose URL is in the box is downloadable")
+
+        self.retype_url(app, OTHER_URL)
+        self.assertFalse(
+            ClipperApp._has_valid_download_data(app),
+            "the box no longer names the loaded video")
+
+        ClipperApp._on_url_changed(app)
+
+        self.assertEqual(
+            app.download_button.state, "disabled",
+            "the Download button stayed green for a URL the app never loaded")
+
+    def test_restoring_the_loaded_url_puts_the_green_back(self):
+        """Control: the reaction is a recomputation, not a one-way latch."""
+        app = self.loaded_video_app()
+        app.update_download_button_state()
+        self.retype_url(app, OTHER_URL)
+        ClipperApp._on_url_changed(app)
+        self.assertEqual(app.download_button.state, "disabled")
+
+        self.retype_url(app, VIDEO_URL)
+        ClipperApp._on_url_changed(app)
+        self.assertEqual(app.download_button.state, "normal",
+                         "retyping the loaded URL did not re-enable Download")
+
+    def test_the_url_entry_notifies_the_app_when_its_text_changes(self):
+        """Structural: the box must actually be wired to that reaction.
+
+        The two tests above drive `ClipperApp._on_url_changed` directly, which
+        proves the reaction is right; this one pins that the URL entry is
+        connected to it, so the reaction cannot exist and stay unreachable.
+        `ClipperApp.__init__` needs a display, so the wiring is read from the
+        source - the same approach `test_ui_event_surface` uses for the event
+        dispatcher.
+        """
+        source = inspect.getsource(ClipperApp.__init__)
+        entry_start = source.index("self.url_entry = ")
+        entry_block = source[entry_start:source.index("self.load_btn = ")]
+
+        self.assertIn(
+            "textvariable", entry_block,
+            "the URL entry has no text variable, so a change to its text "
+            "cannot notify the application")
+        self.assertIn(
+            "trace_add", source,
+            "nothing registers a change notification on the URL box, so the "
+            "Download button is never recomputed while it is being edited")
 
     @staticmethod
     def _no_config_write():
