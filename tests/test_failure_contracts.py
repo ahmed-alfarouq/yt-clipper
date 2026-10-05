@@ -274,6 +274,25 @@ EMPTY_RANGE_STATE = {
 }
 
 
+class RecordingProgressBar:
+    """Stands in for the main determinate CTkProgressBar.
+
+    FakeLoaderApp answers unknown attributes with a permissive no-op, so the
+    bar has to be a real double for its value to be observable at all.
+    """
+
+    def __init__(self, value=0.0):
+        self.value = float(value)
+        self.history = []
+
+    def set(self, value):
+        self.value = float(value)
+        self.history.append(float(value))
+
+    def get(self):
+        return self.value
+
+
 class FakeFFmpegProcess:
     """The slice of subprocess.Popen that run_ffmpeg_clip() actually uses."""
 
@@ -1784,6 +1803,14 @@ class FakeQueueApp(FakeLoaderApp):
         self._queue_status_labels = {}
 
 
+class ProgressTerminalApp(FakeQueueApp):
+    """FakeQueueApp with an observable main progress bar."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.progress = RecordingProgressBar()
+
+
 class TestGuiStateContracts(ContractTestCase):
     def make_controller(self, app):
         controller = QueueController(app)
@@ -1975,6 +2002,89 @@ class TestGuiStateContracts(ContractTestCase):
         # Idempotent: calling it again changes nothing further.
         ClipperApp.reset_time_range(app)
         self.assertEqual(app.loaded_range_state(), EMPTY_RANGE_STATE)
+
+    def test_a_failed_download_clears_the_progress_bar(self):
+        """A failed download must not leave the progress bar mid-fill.
+
+        The bar is determinate and tracks the running download, so a partial
+        value left behind after the job has terminated reads as "still
+        downloading" next to the failure message - and it survives into the
+        next, unrelated operation, because nothing else clears it.
+        """
+        app = ProgressTerminalApp()
+        controller = self.make_controller(app)
+        job = self.make_job(app)
+        app._active_job_id = job.id
+
+        controller._apply_job_started(job.id)
+        controller._apply_download_progress(
+            job.id, {"status": "downloading", "_percent_str": "45%"})
+        self.assertEqual(app.progress.value, 0.45,
+                         "the bar did not track the running download")
+
+        controller._apply_job_error(job.id, "HTTP Error 403: Forbidden")
+
+        self.assertEqual(
+            app.progress.value, 0.0,
+            "a failed download left the progress bar at 45%, which reads as "
+            "still downloading")
+
+    def test_failure_and_cancellation_clear_the_same_progress_state(self):
+        """Both terminal non-success outcomes must leave the same bar state.
+
+        Cancellation already resets the bar; a failure is the same kind of
+        terminal state reached by a different route, so it has to end the same
+        way. Pinned as a pair so the two sibling handlers cannot drift apart
+        again.
+        """
+        def bar_after(terminal_handler):
+            app = ProgressTerminalApp()
+            controller = self.make_controller(app)
+            job = self.make_job(app)
+            app._active_job_id = job.id
+            controller._apply_job_started(job.id)
+            controller._apply_download_progress(
+                job.id, {"status": "downloading", "_percent_str": "45%"})
+            terminal_handler(controller, app, job)
+            return app.progress.value
+
+        after_error = bar_after(
+            lambda c, a, j: c._apply_job_error(j.id, "HTTP Error 403: Forbidden"))
+        after_cancel = bar_after(lambda c, a, j: c._apply_job_cancelled(j.id))
+
+        self.assertEqual(after_error, after_cancel,
+                         "a failed and a cancelled download no longer leave "
+                         "the same progress-bar state")
+
+    def test_a_failed_download_still_reports_the_failure(self):
+        """Control: clearing the bar must not clear the failure report."""
+        app = ProgressTerminalApp()
+        controller = self.make_controller(app)
+        job = self.make_job(app)
+        app._active_job_id = job.id
+        controller._apply_job_started(job.id)
+        controller._apply_job_error(job.id, "HTTP Error 403: Forbidden")
+        controller._queue_idle()
+
+        self.assertEqual(job.status, "Error")
+        self.assertEqual(job.error, "HTTP Error 403: Forbidden")
+        self.assertIn("1 failed", app.statuses[-1][0])
+        self.assertEqual(app.statuses[-1][1], "#e6a817")
+
+    def test_a_successful_download_still_fills_the_progress_bar(self):
+        """Control: the success path keeps filling the bar to completion."""
+        app = ProgressTerminalApp()
+        controller = self.make_controller(app)
+        job = self.make_job(app)
+        app._active_job_id = job.id
+        controller._apply_job_started(job.id)
+        controller._apply_download_progress(
+            job.id, {"status": "downloading", "_percent_str": "45%"})
+        controller._apply_job_done(job.id)
+        controller._queue_idle()
+
+        self.assertEqual(app.progress.value, 1.0)
+        self.assertIn("1 completed", app.statuses[-1][0])
 
     def test_6_the_event_loop_survives_a_broken_handler_and_keeps_a_traceback(self):
         class LoopApp:

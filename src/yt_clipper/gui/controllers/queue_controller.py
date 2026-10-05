@@ -449,7 +449,19 @@ class QueueController:
             return
         job.status = "Error"
         job.error = error_message
+        was_the_running_download = app._active_job_id == job_id
         app._active_job_id = None
+        if was_the_running_download:
+            # A failure is the same kind of terminal state as a cancellation
+            # (§3), so it has to leave the same progress-bar state. The bar
+            # tracks the running download: left mid-fill it reads as "still
+            # downloading" beside the failure message, and nothing else clears
+            # it, so it would survive into the next, unrelated operation.
+            try:
+                app.progress.set(0)
+            except Exception as exc:
+                logger.debug("Progress bar could not be reset after a failed "
+                             "download: %s", describe_failure(exc))
         app.set_status(f"❌ Error: {error_message}", "#e05252")
         self.render_queue()
 
