@@ -190,6 +190,85 @@ class TestSelectionAfterRemoval(ContractTestCase):
 
 
 # ---------------------------------------------------------------------------
+# The status bar follows the selection
+# ---------------------------------------------------------------------------
+
+class TestRemovalUpdatesTheStatusBar(ContractTestCase):
+    """The status bar must not keep advertising a playlist the user just shrank.
+
+    While a playlist is loaded the single-video preview is hidden, and with it
+    `video_info_label` - so the status bar is the only status text that is on
+    screen. `remove_playlist_video` re-renders the preview, restates the hidden
+    label and recomputes the Download button, but it never restates the status
+    bar, which keeps the line it was given when the playlist loaded:
+    "Playlist loaded (2 available...). Click Download to queue them all."
+    That line then sits next to a shorter list and a disabled Download button,
+    and once the last video is removed it invites a download there is nothing
+    left to queue.
+    """
+
+    def make_loader(self, entries, title="P", url=LOADER_PLAYLIST_URL):
+        app = RemovalLoaderApp()
+        loader = video_loader_module.VideoLoaderController(app)
+        loader._apply_playlist_metadata(app._load_request_id, url, title, entries)
+        return app, loader
+
+    def test_removing_a_video_restates_the_status_bar(self):
+        entries = [entry("aaaaaaaaaaa", "alpha"), entry("bbbbbbbbbbb", "beta")]
+        app, loader = self.make_loader(entries)
+        loaded_status = app.statuses[-1]
+
+        loader.remove_playlist_video(app.loaded_playlist_entries[0])
+
+        self.assertNotEqual(
+            app.statuses[-1], loaded_status,
+            "the status bar still repeats the message from when the playlist "
+            "was loaded, after the selection changed")
+        self.assertIn("1", app.statuses[-1][0],
+                      "the status bar does not name the new selection size")
+        self.assertNotIn("Click Download to queue them all", app.statuses[-1][0],
+                         "the status bar still invites a download of the whole "
+                         "playlist after a video was removed")
+
+    def test_removing_the_last_video_says_nothing_is_selected(self):
+        app, loader = self.make_loader([entry("aaaaaaaaaaa", "alpha")])
+
+        loader.remove_playlist_video(app.loaded_playlist_entries[0])
+
+        self.assertIn("No videos selected", app.statuses[-1][0],
+                      "an emptied playlist still reports videos to download")
+        self.assertNotIn("Click Download to queue them all", app.statuses[-1][0],
+                         "the status bar invites a download nothing can satisfy")
+        # The empty selection is a warning, not the success the load reported.
+        self.assertEqual(app.statuses[-1][1], "#e6a817",
+                         "an empty selection was reported in the success colour")
+
+    def test_removing_one_of_many_keeps_the_selection_visible_in_the_status(self):
+        entries = [entry("aaaaaaaaaaa", "alpha"),
+                   entry("bbbbbbbbbbb", "beta"),
+                   entry("ccccccccccc", "gamma")]
+        app, loader = self.make_loader(entries)
+
+        loader.remove_playlist_video(app.loaded_playlist_entries[1])
+
+        self.assertIn("2", app.statuses[-1][0],
+                      "the status bar does not name the two videos still selected")
+        self.assertNotIn("3 available", app.statuses[-1][0],
+                         "the status bar still counts the removed video")
+
+    def test_a_removal_that_changes_nothing_leaves_the_status_bar_alone(self):
+        """A no-op removal must not restate a status the user already has."""
+        entries = [entry("aaaaaaaaaaa", "alpha"), entry("bbbbbbbbbbb", "beta")]
+        app, loader = self.make_loader(entries)
+        loaded_status = app.statuses[-1]
+
+        loader.remove_playlist_video(entry("zzzzzzzzzzz", "not loaded"))
+
+        self.assertEqual(app.statuses[-1], loaded_status,
+                         "a removal that changed nothing rewrote the status bar")
+
+
+# ---------------------------------------------------------------------------
 # Test 3 / 4 — the excluded videos never become download jobs
 # ---------------------------------------------------------------------------
 

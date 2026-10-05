@@ -439,7 +439,18 @@ class VideoLoaderController:
         return None
 
     def _refresh_playlist_summary(self):
-        """Restate how many videos are still selected for download."""
+        """Restate how many videos are still selected for download.
+
+        Both surfaces that describe the selection are restated here, so they
+        cannot drift apart. The status bar matters as much as the label: while
+        a playlist is loaded the single-video preview is hidden, and with it
+        `video_info_label`, so the status bar is the only one of the two the
+        user can actually read. Restating only the hidden one left the status
+        bar showing the "N available ... Click Download to queue them all" line
+        from the load - next to a shorter list and a disabled Download button,
+        and once the last video is removed, inviting a download there is
+        nothing left to queue.
+        """
         app = self.app
         remaining = len(app.loaded_playlist_entries or [])
         if remaining:
@@ -451,6 +462,11 @@ class VideoLoaderController:
                 ),
                 text_color="#4caf50",
             )
+            app.set_status(
+                f"Playlist updated: {remaining} video"
+                f"{'s' if remaining != 1 else ''} selected for download",
+                "#4caf50",
+            )
         else:
             app.video_info_label.configure(
                 text=(
@@ -459,6 +475,11 @@ class VideoLoaderController:
                     "Load the playlist again to start over"
                 ),
                 text_color="#e6a817",
+            )
+            app.set_status(
+                "No videos selected for download — load the playlist again to "
+                "start over",
+                "#e6a817",
             )
 
     def _apply_video_metadata(self, request_id, url, title, duration, entry=None):
