@@ -427,6 +427,210 @@ class TestPreviewWidgetRemoval(ContractTestCase):
 
 
 # ---------------------------------------------------------------------------
+# Title truncation + fixed remove-button sizing
+# ---------------------------------------------------------------------------
+
+LONG_TITLE = ("This Is An Extremely Long Video Title That Would Break The "
+              "Playlist Preview Layout")
+SHORT_TITLE = "My Cat Plays Piano"
+
+
+class RecordingCtk:
+    """Records the kwargs a stubbed toolkit widget was constructed with.
+
+    The real toolkit needs a display, so the card is built under the stub and
+    the *configuration* is read back - never a pixel measurement.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = dict(kwargs)
+        self.calls = []
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+
+        def _record(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            return None
+
+        return _record
+
+
+def render_card(title):
+    """Build one preview card and return (widget, created labels, created buttons)."""
+    preview = playlist_preview_module.PlaylistPreviewWidget(None)
+    # The stub cannot enumerate Tk children; the widget only iterates them to
+    # destroy them, so an empty list is an honest stand-in for "no rows yet".
+    preview.scroll_frame.winfo_children = lambda: []
+
+    labels, buttons = [], []
+
+    def label(*args, **kwargs):
+        widget = RecordingCtk(*args, **kwargs)
+        labels.append(widget)
+        return widget
+
+    def button(*args, **kwargs):
+        widget = RecordingCtk(*args, **kwargs)
+        buttons.append(widget)
+        return widget
+
+    with mock.patch.object(playlist_preview_module.ctk, "CTkLabel", label), \
+            mock.patch.object(playlist_preview_module.ctk, "CTkButton", button):
+        preview.set_videos([playlist_entry("aaaaaaaaaaa", title)])
+
+    return preview, labels, buttons
+
+
+def card_of(title):
+    """The widgets of one rendered card: (title label, remove button)."""
+    _, labels, buttons = render_card(title)
+    # Creation order in the card: thumbnail label, title label, date label.
+    return labels[1], buttons[0]
+
+
+class TestTitleDisplayTruncation(unittest.TestCase):
+    """The preview shortens the title it shows; the data keeps the original."""
+
+    def truncate(self, title):
+        return playlist_preview_module.truncate_title_for_display(title)
+
+    # ---- §5.4 truncation rules ----
+
+    def test_an_empty_title_stays_empty(self):
+        self.assertEqual(self.truncate(""), "")
+
+    def test_a_missing_title_stays_empty(self):
+        self.assertEqual(self.truncate(None), "")
+
+    def test_a_one_word_title_is_unchanged(self):
+        self.assertEqual(self.truncate("Piano"), "Piano")
+
+    def test_a_short_title_is_unchanged(self):
+        self.assertEqual(self.truncate(SHORT_TITLE), SHORT_TITLE)
+
+    def test_a_title_exactly_at_the_word_limit_is_unchanged(self):
+        limit = playlist_preview_module.TITLE_MAX_WORDS
+        title = " ".join(f"word{i}" for i in range(limit))
+        self.assertEqual(self.truncate(title), title,
+                         "a title exactly at the word limit was still truncated")
+
+    def test_a_title_over_the_word_limit_is_truncated_with_a_marker(self):
+        shown = self.truncate(LONG_TITLE)
+        self.assertTrue(shown.endswith("..."),
+                        "the truncation marker is missing")
+        self.assertNotIn("Layout", shown,
+                         "words past the limit were still shown")
+        self.assertEqual(
+            shown[:-len("...")].split(" "),
+            LONG_TITLE.split(" ")[:playlist_preview_module.TITLE_MAX_WORDS],
+            "the cut did not land on the word limit")
+
+    def test_a_very_long_title_is_bounded(self):
+        shown = self.truncate("supercalifragilistic " * 40)
+        self.assertLessEqual(len(shown), playlist_preview_module.TITLE_MAX_CHARS,
+                             "the displayed title is not length-bounded")
+
+    def test_repeated_whitespace_is_collapsed_and_deterministic(self):
+        messy = "  My   Cat \t Plays \n Piano  "
+        self.assertEqual(self.truncate(messy), "My Cat Plays Piano")
+        self.assertEqual(self.truncate(messy), self.truncate(messy))
+
+    def test_punctuation_only_titles_stay_visible(self):
+        self.assertEqual(self.truncate("..."), "...")
+        self.assertEqual(self.truncate("!?"), "!?")
+
+    def test_a_cut_never_leaves_a_dangling_separator(self):
+        shown = self.truncate("one two three, four five, six seven")
+        self.assertTrue(shown.endswith("..."))
+        self.assertFalse(shown[:-3].rstrip().endswith((",", ";", ":")),
+                         "the cut left a dangling separator before the marker")
+
+    def test_a_non_latin_title_is_bounded_whatever_the_glyphs(self):
+        # Words and characters behave very differently in Arabic, so both
+        # limits have to hold rather than only the word one.
+        multi_word = "هذا عنوان فيديو طويل جدا لا يناسب بطاقة المعاينة"
+        self.assertLessEqual(len(self.truncate(multi_word)),
+                             playlist_preview_module.TITLE_MAX_CHARS)
+        unbroken = "هذا" * 100
+        self.assertLessEqual(len(self.truncate(unbroken)),
+                             playlist_preview_module.TITLE_MAX_CHARS,
+                             "a long unbroken non-Latin title was not "
+                             "character-bounded")
+
+    def test_truncation_is_pure(self):
+        """The helper is a presentation transform: same input, same output."""
+        self.assertEqual(self.truncate(LONG_TITLE), self.truncate(LONG_TITLE))
+
+    # ---- §7 data vs presentation ----
+
+    def test_the_original_title_is_never_mutated(self):
+        entry = playlist_entry("aaaaaaaaaaa", LONG_TITLE)
+        render_card(entry["title"])
+        self.assertEqual(entry["title"], LONG_TITLE,
+                         "rendering the card changed the playlist data")
+
+    def test_the_card_shows_the_truncated_title_but_keeps_the_data(self):
+        entry = playlist_entry("aaaaaaaaaaa", LONG_TITLE)
+        title_label, _ = card_of(entry["title"])
+        self.assertEqual(title_label.kwargs["text"],
+                         playlist_preview_module.truncate_title_for_display(LONG_TITLE))
+        self.assertNotEqual(title_label.kwargs["text"], LONG_TITLE)
+
+    def test_a_short_title_is_shown_in_full(self):
+        title_label, _ = card_of(SHORT_TITLE)
+        self.assertEqual(title_label.kwargs["text"], SHORT_TITLE)
+
+
+class TestRemoveButtonSizingIsTitleIndependent(unittest.TestCase):
+    """§3.4: the X button's dimensions do not depend on the title length."""
+
+    def test_the_button_is_configured_with_an_explicit_size(self):
+        _, button = card_of(SHORT_TITLE)
+        self.assertIn("width", button.kwargs,
+                      "the remove button has no explicit width")
+        self.assertIn("height", button.kwargs,
+                      "the remove button has no explicit height")
+        self.assertGreater(button.kwargs["width"], 0)
+        self.assertGreater(button.kwargs["height"], 0)
+
+    def test_a_long_title_does_not_change_the_configured_button_size(self):
+        short_label, short_button = card_of(SHORT_TITLE)
+        long_label, long_button = card_of(LONG_TITLE)
+
+        # The two cards really do carry different titles...
+        self.assertNotEqual(short_label.kwargs["text"], long_label.kwargs["text"])
+        # ...yet the remove control is configured identically.
+        self.assertEqual(short_button.kwargs["width"], long_button.kwargs["width"])
+        self.assertEqual(short_button.kwargs["height"], long_button.kwargs["height"])
+
+    def test_the_title_never_asks_for_more_width_than_the_row_leaves_it(self):
+        """The row's request must stay inside the narrowest row the app supports.
+
+        `ClipperApp.minsize(480, 500)` and `resizable(True, True)` mean the
+        playlist row can be as narrow as ~348px. Tk's packer shrinks slaves
+        when the row's requested width exceeds what it has, and the remove
+        button - packed `side="right"` with no `expand` and no `fill` - is one
+        of those slaves. So the title's wrap width has to leave room for the
+        thumbnail and the button at that narrowest width.
+        """
+        _, labels, _ = render_card(LONG_TITLE)
+        wrap = labels[1].kwargs["wraplength"]
+
+        thumbnail = playlist_preview_module.THUMBNAIL_SIZE[0]
+        button = card_of(SHORT_TITLE)[1].kwargs["width"]
+        padding = 16 + 8          # thumbnail padx(8,8) + button padx(0,8)
+        narrowest_row = 348       # derived from the app's own chrome at 480px
+
+        self.assertLessEqual(
+            wrap + thumbnail + button + padding, narrowest_row,
+            "the title can request more width than the narrowest row has, so "
+            "the packer has to shrink the remove button to fit it")
+
+
+# ---------------------------------------------------------------------------
 # Static verification of the card's removal control
 # ---------------------------------------------------------------------------
 

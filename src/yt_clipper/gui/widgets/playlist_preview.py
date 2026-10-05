@@ -27,6 +27,69 @@ THUMBNAIL_SIZE = (120, 68)
 SCROLL_FRAME_HEIGHT = 190
 ITEM_HEIGHT = 84
 
+# --- Title presentation ---------------------------------------------------
+# A playlist card is a fixed ITEM_HEIGHT row holding a thumbnail, the title and
+# date text, and the remove control. ClipperApp sets minsize(480, 500) and
+# resizable(True, True), so the narrowest row the app supports is ~348px wide
+# (card padx 25 + card scrollbar ~15 + preview padx 20 + preview scrollbar ~15
+# + item_frame padx 6). The thumbnail (120 + 16 padding) and the remove button
+# (32 + 8 padding) are fixed, which leaves ~172px for the title.
+#
+# Tk's packer shrinks slaves when a row's requested width exceeds what it has,
+# and the remove button - packed side="right" with no expand and no fill - is
+# one of those slaves. So the title must never ask for more than the space left
+# over, or its length decides how big the remove control is.
+TITLE_WRAP_WIDTH = 160
+
+# A word-boundary cut keeps the shortened title readable; a character cap
+# bounds the rendered width for glyphs wider than the Latin average, which a
+# fixed word count cannot do on its own. 160px of 12pt bold holds ~20
+# characters, so 44 characters is about two lines - inside the ~3 lines an
+# 84px row leaves above the date line.
+TITLE_MAX_WORDS = 6
+TITLE_MAX_CHARS = 44
+TITLE_TRUNCATION_SUFFIX = "..."
+
+
+def truncate_title_for_display(title, max_words=TITLE_MAX_WORDS,
+                               max_chars=TITLE_MAX_CHARS,
+                               suffix=TITLE_TRUNCATION_SUFFIX):
+    """Shorten a video title for the preview card, without touching the data.
+
+    Returns the display string only. The playlist entry keeps its full title
+    for the queue, the logs and the metadata, so nothing downstream of the
+    preview ever sees the shortened form.
+
+    Two limits keep the rendered title inside the card's title area whatever
+    the glyphs are:
+      * a word limit, so the cut always lands on a word boundary and the
+        result stays readable;
+      * a character limit, because words have different widths and a fixed
+        word count cannot bound the rendered width on its own.
+    """
+    text = " ".join(str(title if title is not None else "").split())
+    if not text:
+        return text
+
+    words = text.split(" ")
+    over_word_limit = len(words) > max_words
+    if over_word_limit:
+        text = " ".join(words[:max_words])
+
+    over_char_limit = len(text) > max_chars - len(suffix)
+    if over_char_limit:
+        text = text[: max(0, max_chars - len(suffix))]
+
+    if not (over_word_limit or over_char_limit):
+        return text
+
+    # Drop a dangling separator the cut left behind, then mark the truncation
+    # so a shortened title is never mistaken for the whole one.
+    text = text.rstrip()
+    if text[-1:] in (",", ";", ":"):
+        text = text[:-1].rstrip()
+    return text + suffix
+
 
 class PlaylistPreviewWidget(ctk.CTkFrame):
     """Scrollable playlist preview sorted oldest→newest.
@@ -250,12 +313,14 @@ class PlaylistPreviewWidget(ctk.CTkFrame):
         text_frame = ctk.CTkFrame(item_frame, fg_color="transparent")
         text_frame.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=6)
 
+        # The card shows the shortened title only; `title` above is what the
+        # queue, the logs and the metadata keep using (see the helper).
         title_label = ctk.CTkLabel(
             text_frame,
-            text=title,
+            text=truncate_title_for_display(title),
             anchor="w",
             justify="left",
-            wraplength=280,
+            wraplength=TITLE_WRAP_WIDTH,
             font=ctk.CTkFont(size=12, weight="bold"),
         )
         title_label.pack(fill="x", anchor="w")
