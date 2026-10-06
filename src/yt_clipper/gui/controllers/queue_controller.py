@@ -565,6 +565,21 @@ class QueueController:
         app.video_duration = None
         app.reset_time_range()
         app.video_loader._set_thumbnail(None, False)
+        # The bump above abandons a load that is still in flight, and the load's
+        # own terminal handlers are the only things that put the Load button and
+        # the load bar back - those events are now stale and will be dropped.
+        # Invalidating a load therefore obliges the reset to restore the load
+        # path itself, or the window stays on "Loading..." forever.
+        try:
+            app.load_btn.configure(state="normal", text="Load Video")
+        except Exception as exc:
+            logger.debug("Load button could not be restored on reset: %s",
+                         describe_failure(exc))
+        try:
+            app.video_loader._hide_load_progress()
+        except Exception as exc:
+            logger.debug("Load progress could not be hidden on reset: %s",
+                         describe_failure(exc))
         try:
             app.playlist_preview.clear()
         except Exception as exc:

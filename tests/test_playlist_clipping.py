@@ -1099,6 +1099,199 @@ class TestDownloadActionStateConsistency(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# The load path must survive a form reset
+# ---------------------------------------------------------------------------
+
+class LoadButton:
+    """The Load button with its label and enabled state observable.
+
+    FakeApp answers unknown attributes with a permissive no-op, so
+    `load_btn.configure(state=..., text=...)` would leave nothing to assert on.
+    """
+
+    def __init__(self):
+        self.state = "normal"
+        self.text = "Load Video"
+
+    def configure(self, **kwargs):
+        if "state" in kwargs:
+            self.state = kwargs["state"]
+        if "text" in kwargs:
+            self.text = kwargs["text"]
+
+
+class LoadProgress:
+    """The indeterminate load bar with visibility and animation observable."""
+
+    def __init__(self):
+        self.visible = False
+        self.running = False
+
+    def pack(self, *args, **kwargs):
+        self.visible = True
+
+    def pack_forget(self):
+        self.visible = False
+
+    def winfo_manager(self):
+        return "pack" if self.visible else ""
+
+    def start(self):
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+
+class LoadPathApp(FakeApp):
+    """FakeApp with an observable load path and real event routing.
+
+    `reset_fields()` bumps `_load_request_id` to abandon a load that is still in
+    flight, and the load's own terminal handlers are the only things that put
+    the Load button and the load bar back. The double therefore needs both
+    widgets observable, and the worker's events routed the way `_poll_ui_events`
+    does on the main thread, so a test can tell "suppressed by the request-id
+    guard" apart from "never delivered".
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.download_button = StateButton()
+        self.load_btn = LoadButton()
+        self.load_progress = LoadProgress()
+        self.start_slider = RecordingSlider(self.start_input.get_seconds())
+        self.end_slider = RecordingSlider(self.end_input.get_seconds())
+        self.clip_length_label = RecordingWidget()
+        self.events = []
+        # FakeApp answers unknown attributes with a permissive no-op, so
+        # without this the whole loader - and the load path under test - would
+        # silently do nothing.
+        self.video_loader = video_loader_module.VideoLoaderController(self)
+
+    # ---- real ClipperApp logic, delegated ----
+    def _url_names_the_loaded_video(self):
+        return ClipperApp._url_names_the_loaded_video(self)
+
+    def _clip_range_is_downloadable(self):
+        return ClipperApp._clip_range_is_downloadable(self)
+
+    def _has_valid_download_data(self):
+        return ClipperApp._has_valid_download_data(self)
+
+    def update_clip_length(self):
+        return ClipperApp.update_clip_length(self)
+
+    def update_download_button_state(self):
+        return ClipperApp.update_download_button_state(self)
+
+    # ---- event routing, as _poll_ui_events does it on the main thread ----
+    def _post_ui_event(self, name, *payload):
+        self.events.append((name, payload))
+
+    def event_names(self):
+        return [name for name, _ in self.events]
+
+    def dispatch(self):
+        while self.events:
+            name, payload = self.events.pop(0)
+            ClipperApp._handle_ui_event(self, name, payload)
+
+
+class TestLoadPathSurvivesFormReset(GuiTestCase):
+    """Queueing a clip must not strand the load path.
+
+    `reset_fields()` bumps `_load_request_id`, which suppresses every terminal
+    handler of a load still in flight - and those handlers are the only things
+    that restore the Load button and the load bar. Invalidating a load therefore
+    obliges the reset to leave the load path the way it found it.
+    """
+
+    def load_path_app(self, **kwargs):
+        kwargs.setdefault("output_path", self.tmp / "clip.mp4")
+        app = LoadPathApp(**kwargs)
+        self.addCleanup(app.harness.shutdown)
+        return app
+
+    def test_reset_fields_restores_the_load_path_ui(self):
+        app = self.load_path_app(url=VIDEO_URL, duration=60.0,
+                                 start_seconds=0, end_seconds=60)
+        entered, release = threading.Event(), threading.Event()
+
+        def gated(url, on_retry=None):
+            entered.set()
+            release.wait(10)
+            return single_video_result(VIDEO_URL, duration=60.0)
+
+        with mock.patch.object(video_loader_module.downloader, "expand_playlist",
+                               side_effect=gated):
+            app.video_loader.start_load_video()
+            self.assertTrue(entered.wait(10), "the load never started")
+            # the loading state start_load_video() puts the window into
+            self.assertEqual((app.load_btn.state, app.load_btn.text),
+                             ("disabled", "Loading..."))
+            self.assertTrue(app.load_progress.visible)
+
+            self.make_controller(app).reset_fields()
+        release.set()
+
+        self.assertEqual((app.load_btn.state, app.load_btn.text),
+                         ("normal", "Load Video"),
+                         "the Load button was left disabled after the reset")
+        self.assertFalse(app.load_progress.visible,
+                         "the load bar was left up after the reset")
+        self.assertFalse(app.load_progress.running,
+                         "the load bar was left animating after the reset")
+
+    def test_a_clip_queued_mid_load_does_not_strand_the_load_path(self):
+        """The reachable sequence, end to end.
+
+        A load in flight, the recompute that puts the green back on Download
+        (5J), the click, and then the load's own events arriving - which the
+        bumped request id suppresses. What the user is left with has to be a
+        window that can still load a video.
+        """
+        app = self.load_path_app(url=VIDEO_URL, duration=60.0,
+                                 start_seconds=0, end_seconds=60)
+        entered, release, finished = (threading.Event(), threading.Event(),
+                                      threading.Event())
+
+        def gated(url, on_retry=None):
+            entered.set()
+            release.wait(10)
+            finished.set()
+            return single_video_result(VIDEO_URL, title="video a reloaded",
+                                       duration=75.0)
+
+        with mock.patch.object(video_loader_module.downloader, "expand_playlist",
+                               side_effect=gated):
+            app.video_loader.start_load_video()
+            self.assertTrue(entered.wait(10), "the load never started")
+
+            app.update_download_button_state()
+            self.assertEqual(app.download_button.state, "normal",
+                             "the green was not put back on Download mid-load")
+
+            recorder = DownloadCallRecorder()
+            with recorder.patch(), self._no_config_write():
+                self.make_controller(app).download_clip()
+            self.assertEqual(len(app.queue_jobs), 1, "the clip was not queued")
+
+            release.set()
+            self.assertTrue(finished.wait(10), "the load never finished")
+
+        # the abandoned load must not be applied over the reset form
+        app.dispatch()
+        self.assertIsNone(app.loaded_url,
+                          "the abandoned load was applied over the reset form")
+
+        self.assertEqual((app.load_btn.state, app.load_btn.text),
+                         ("normal", "Load Video"),
+                         "the Load button was left stuck on 'Loading...'")
+        self.assertFalse(app.load_progress.visible,
+                         "the load bar was left spinning after the reset")
+
+
+# ---------------------------------------------------------------------------
 # GUI/CLI parity
 # ---------------------------------------------------------------------------
 
